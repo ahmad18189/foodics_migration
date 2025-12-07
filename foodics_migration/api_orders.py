@@ -5,13 +5,10 @@ from __future__ import annotations
 import json
 import time
 from typing import Dict, Any, Iterable, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import frappe
 import requests
-from urllib.parse import urlparse, parse_qs, urlencode
-
-# at top:
-from urllib.parse import quote
 
 INCLUDE_PARTS = [
     "branch","device","creator","closer",
@@ -26,7 +23,7 @@ INCLUDE_PARTS = [
 INCLUDE_Q = quote(",".join(INCLUDE_PARTS), safe=",")
 
 def _fetch_single_order_with_include(cfg, s, order_id: str) -> Dict[str, Any]:
-    base = _safe_base_url(cfg.base_url)
+    base = _safe_base_url(cfg.foodics_base_url)
     # NOTE: orders/{id} endpoint (not the list) – more reliable for relationships
     url = f"{base}/orders/{order_id}?include={INCLUDE_Q}"
     print(f"[debug] Fallback refetch one order: {url}")
@@ -73,7 +70,7 @@ _CHARGES_INCLUDE_Q = quote(",".join([
 # ---------------------------
 def _fetch_order_children_via_children_endpoints(cfg, s, order_id: str) -> Dict[str, Any]:
     """Return dict with any of: products, combos, payments, charges (lists)."""
-    base = _safe_base_url(cfg.base_url)
+    base = _safe_base_url(cfg.foodics_base_url)
     out = {}
 
     def _fetch_list(endpoint: str, include_q: str) -> list:
@@ -110,55 +107,75 @@ def _fetch_order_children_via_children_endpoints(cfg, s, order_id: str) -> Dict[
 
     return out
 
-def _rebuild_next_with_include(cfg, next_url: str) -> str:
+def _rebuild_next_with_include(cfg, next_url: str, date_filters: Optional[Dict[str, Any]] = None) -> str:
     """Foodics 'links.next' often misses include/per_page; re-attach them."""
     if not next_url:
         return next_url
-    base = _safe_base_url(cfg.base_url)
+    base = _safe_base_url(cfg.foodics_base_url)
     # next_url might be absolute ("https://api.foodics.com/v5/orders?page=2")
     # or relative (rare). We only keep the page param from it.
     pr = urlparse(next_url)
     qs = parse_qs(pr.query)
     page = qs.get("page", ["1"])[0]
+    
+    # Build query parameters
+    query_params = {
+        "include": INCLUDE_Q,
+        "sort": "id",
+        "page": page,
+        "per_page": str(int(cfg.foodics_per_page)),
+    }
+    
+    # Add date filters if provided
+    if date_filters:
+        from_date = date_filters.get("from_date")
+        to_date = date_filters.get("to_date")
+        date_field = date_filters.get("date_field", "business_date")
+        
+        if from_date or to_date:
+            if date_field == "business_date":
+                if from_date:
+                    query_params["filter[business_date_after]"] = from_date
+                if to_date:
+                    query_params["filter[business_date_before]"] = to_date
+            elif date_field == "updated_at":
+                if from_date:
+                    query_params["filter[updated_after]"] = from_date
+            elif date_field == "created_at":
+                if from_date:
+                    query_params["filter[created_on]"] = from_date
+    
     # Rebuild full list URL with our canonical params
-    return (
-        f"{base}/orders?"
-        f"include={INCLUDE_Q}"
-        f"&sort=id"
-        f"&page={page}"
-        f"&per_page={int(cfg.per_page)}"
-    )
+    return f"{base}/orders?{urlencode(query_params)}"
 
-def _cfg() -> frappe._dict:
-    """Load Foodics Settings (single doctype)."""
-    doc = frappe.get_single("Foodics Settings")
-    if not doc.foodics_base_url:
-        frappe.throw("Foodics Settings: `foodics_base_url` is required.")
-    if not doc.foodics_token:
-        frappe.throw("Foodics Settings: `foodics_token` (Bearer) is required.")
-    return frappe._dict(
-        base_url=(doc.foodics_base_url or "").strip(),
-        token=(doc.foodics_token or "").strip(),
-        per_page=int(doc.foodics_per_page or DEFAULT_PER_PAGE),
-        commit_every=int(getattr(doc, "commit_every_orders", None) or DEFAULT_COMMIT_EVERY),
-    )
+def _cfg():
+    """Load Foodics Settings using the proper config loader."""
+    from foodics_migration.utils import load_foodics_settings
+    return load_foodics_settings()
 
 
-def _safe_base_url(base_url: str) -> str:
+def _safe_base_url(base_url: Optional[str]) -> str:
     """
     Build a safe base URL.
     - If stored as 'https://api.foodics.com/v5' -> use as-is.
     - If stored as 'api.foodics.com/v5'       -> prepend https://
     """
+    if not base_url:
+        frappe.throw("Foodics base URL is not configured. Please check Foodics Settings.")
     if base_url.startswith("http://") or base_url.startswith("https://"):
         return base_url.rstrip("/")
     return "https://" + base_url.rstrip("/")
 
 
-def _new_session(token: str) -> requests.Session:
+def _new_session(cfg_or_token) -> requests.Session:
+    """Create a requests session. Accepts either a FoodicsConfig object or a token string."""
+    from foodics_migration.utils import make_foodics_session, FoodicsConfig
+    if isinstance(cfg_or_token, FoodicsConfig):
+        return make_foodics_session(cfg_or_token)
+    # Legacy: if token string is passed
     s = requests.Session()
     s.headers.update({
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {cfg_or_token}",
         "Accept": "application/json",
         "User-Agent": "ERPNext-Foodics-Migration/1.0",
     })
@@ -214,6 +231,27 @@ def _reset_child_tables(order_doc: frappe.model.document.Document) -> None:
     for childfield in ("items", "combos", "payments", "charges"):
         if childfield in (order_doc.as_dict() or {}):
             order_doc.set(childfield, [])
+
+
+def _is_order_fully_paid(order_json: Dict[str, Any]) -> bool:
+    """
+    Check if an order is fully paid by comparing sum of payments to total price.
+    Returns True if sum(payments.amount) >= total_price (with 0.01 tolerance for rounding).
+    """
+    total_price = order_json.get("total_price") or 0
+    if total_price == 0:
+        return False  # Free orders might not have payments
+    
+    payments = order_json.get("payments") or []
+    payments_total = sum(float(p.get("amount") or 0) for p in payments)
+    
+    # Allow small tolerance for rounding (0.01)
+    is_paid = payments_total >= (float(total_price) - 0.01)
+    
+    if not is_paid:
+        print(f"[debug] Order {order_json.get('id')} not fully paid: payments={payments_total}, total={total_price}")
+    
+    return is_paid
 
 
 def _parent_name_for(foodics_order_id: str) -> Optional[str]:
@@ -289,6 +327,60 @@ def _map_parent_fields(order_json: Dict[str, Any], doc: frappe.model.document.Do
     cl = order_json.get("closer") or {}
     _set_if_exists(doc, "closer_id", cl.get("id"))
     _set_if_exists(doc, "closer_name", cl.get("name"))
+    
+    # Customer snapshot - extract from customer object or relationships
+    # IMPORTANT: Handle null customer (walk-in orders may not have a customer)
+    customer = order_json.get("customer")
+    
+    # DEBUG: Print customer info
+    print(f"[debug] Order {order_json.get('id')}: customer={customer} (type: {type(customer).__name__})")
+    
+    customer_id_to_set = None
+    
+    # If customer is null, set customer_id to None (walk-in order)
+    if customer is None:
+        print(f"[debug] Customer is null - setting customer_id to None")
+        customer_id_to_set = None
+    elif isinstance(customer, dict) and len(customer) > 0:
+        # Customer is a non-empty dict - extract ID
+        customer_id_to_set = customer.get("id")
+        if not customer_id_to_set and customer.get("attributes"):
+            customer_id_to_set = customer.get("attributes", {}).get("id")
+        print(f"[debug] Extracted customer_id from customer dict: {customer_id_to_set}")
+    elif isinstance(customer, dict) and len(customer) == 0:
+        # Empty dict - check relationships and included
+        relationships = order_json.get("relationships") or {}
+        if isinstance(relationships, dict) and "customer" in relationships:
+            customer_rel = relationships.get("customer") or {}
+            if isinstance(customer_rel, dict):
+                customer_data = customer_rel.get("data") or {}
+                if isinstance(customer_data, dict):
+                    customer_id_to_set = customer_data.get("id")
+                elif isinstance(customer_data, str):
+                    customer_id_to_set = customer_data
+            elif isinstance(customer_rel, str):
+                customer_id_to_set = customer_rel
+        
+        # Also check included resources (JSON:API format)
+        if not customer_id_to_set and "included" in order_json:
+            included = order_json.get("included") or []
+            for resource in included:
+                if isinstance(resource, dict) and resource.get("type") == "customer":
+                    customer_id_to_set = resource.get("id")
+                    break
+        print(f"[debug] Extracted customer_id from relationships/included: {customer_id_to_set}")
+    
+    # Set customer_id (or None if null customer)
+    # Always set customer_id, even if None (to clear previous values)
+    if _has_field(doc.doctype, "customer_id"):
+        # Use direct assignment to ensure None is set correctly
+        doc.customer_id = customer_id_to_set
+        if customer_id_to_set:
+            print(f"[debug] Set customer_id to: {customer_id_to_set} for order {order_json.get('id')}")
+        else:
+            print(f"[debug] Set customer_id to None (null customer - walk-in order) for order {order_json.get('id')}")
+    else:
+        print(f"[debug] customer_id field does not exist on {doc.doctype}")
 
     # raw blob
     raw = json.dumps(order_json, ensure_ascii=False)
@@ -449,20 +541,56 @@ def _map_children(order_json: Dict[str, Any], doc: frappe.model.document.Documen
 # FETCH / UPSERT
 # ---------------------------
 
-def _paginate_orders(cfg: frappe._dict, s: requests.Session):
-    base = _safe_base_url(cfg.base_url)
+def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optional[Dict[str, Any]] = None, only_fully_paid: bool = False):
+    """
+    Paginate through Foodics orders with optional date filtering and fully paid filter.
+    
+    Args:
+        cfg: Foodics configuration
+        s: Requests session
+        date_filters: Optional dict with from_date, to_date, date_field
+        only_fully_paid: If True, only yield orders where sum(payments) >= total_price
+    """
+    base = _safe_base_url(cfg.foodics_base_url)
     page = 1
-    print(f"[info] Page size: {cfg.per_page}")
-    print(f"[info] Commit every: {cfg.commit_every} order(s)")
+    print(f"[info] Page size: {cfg.foodics_per_page}")
+    print(f"[info] Commit every: {cfg.commit_every_n_records} order(s)")
     print(f"[info] Using include={INCLUDE_Q}")
+    if only_fully_paid:
+        print(f"[info] Filtering: Only fully paid orders")
+    
+    # Build query parameters
+    query_params = {
+        "include": INCLUDE_Q,
+        "sort": "id",
+        "page": str(page),
+        "per_page": str(int(cfg.foodics_per_page)),
+    }
+    
+    # Add date filters if provided
+    if date_filters:
+        from_date = date_filters.get("from_date")
+        to_date = date_filters.get("to_date")
+        date_field = date_filters.get("date_field", "business_date")
+        
+        if from_date or to_date:
+            if date_field == "business_date":
+                if from_date:
+                    query_params["filter[business_date_after]"] = from_date
+                if to_date:
+                    query_params["filter[business_date_before]"] = to_date
+            elif date_field == "updated_at":
+                if from_date:
+                    query_params["filter[updated_after]"] = from_date
+            elif date_field == "created_at":
+                if from_date:
+                    query_params["filter[created_on]"] = from_date
+                if to_date:
+                    # Foodics API uses created_on for date, but we can add range if needed
+                    pass
+            print(f"[info] Date filters: {date_field} from {from_date} to {to_date}")
 
-    url = (
-        f"{base}/orders?"
-        f"include={INCLUDE_Q}"
-        f"&sort=id"
-        f"&page={page}"
-        f"&per_page={int(cfg.per_page)}"
-    )
+    url = f"{base}/orders?{urlencode(query_params)}"
 
     while url:
         print(f"[info] === Page {page} ===")
@@ -470,21 +598,35 @@ def _paginate_orders(cfg: frappe._dict, s: requests.Session):
         data = _get_with_backoff(s, url)
         rows = data.get("data") or []
         print(f"[debug] fetched {len(rows)} orders on this page")
+        
         for row in rows:
+            # Filter for fully paid orders if requested
+            if only_fully_paid:
+                if not _is_order_fully_paid(row):
+                    continue
             yield row
         links = data.get("links") or {}
         nxt = links.get("next")
-        url = _rebuild_next_with_include(cfg, nxt) if nxt else None
+        if nxt:
+            # Rebuild URL with date filters preserved
+            url = _rebuild_next_with_include(cfg, nxt, date_filters)
+        else:
+            url = None
         page += 1
 
 
 
 
 
-def _upsert_one_order(order_json: Dict[str, Any]) -> str:
+def _upsert_one_order(order_json: Dict[str, Any], update_if_exists: bool = False) -> str:
     print(_parent_log_header(order_json))
     oid = order_json.get("id")
     existing = _parent_name_for(oid)
+    
+    # Check if should skip update
+    if existing and not update_if_exists:
+        print(f"  ⊘ Skipped order (exists, update disabled): {existing} (Foodics {oid})")
+        return existing
 
     # quick visibility into what we actually received
     got_keys = sorted(list(order_json.keys()))
@@ -500,7 +642,7 @@ def _upsert_one_order(order_json: Dict[str, Any]) -> str:
         print("[warn] No child arrays on list row. Trying single-order refetch with include …")
         try:
             cfg_local = _cfg()
-            s_local = _new_session(cfg_local.token)
+            s_local = _new_session(cfg_local)
             order_full = _fetch_single_order_with_include(cfg_local, s_local, oid)
             got_child_now = any(k in order_full for k in ("products","combos","payments","charges"))
             print(f"[debug] after refetch, have children? {got_child_now}")
@@ -511,7 +653,7 @@ def _upsert_one_order(order_json: Dict[str, Any]) -> str:
         except Exception as refetch_err:
             print(f"[warn] single-order refetch failed ({refetch_err}). Falling back to child endpoints …")
             cfg_local = _cfg()
-            s_local = _new_session(cfg_local.token)
+            s_local = _new_session(cfg_local)
             stitched = _fetch_order_children_via_children_endpoints(cfg_local, s_local, oid)
             # Only attach non-empty children to the list-row json so downstream mappers see them
             for k, v in stitched.items():
@@ -607,33 +749,89 @@ def _upsert_one_order(order_json: Dict[str, Any]) -> str:
 @frappe.whitelist()
 def sync_foodics_orders():
     """
-    Fetch ALL orders (all pages) with combos/payments/charges & products,
+    Fetch orders (with optional date filtering) with combos/payments/charges & products,
     store raw JSON, strict-mirror child rows, and commit every N orders.
+    Optionally creates Sales Invoices from orders.
     """
     try:
         cfg = _cfg()
-        s = _new_session(cfg.token)
+        s = _new_session(cfg)
+        
+        # Get settings
+        settings = frappe.get_single("Foodics Settings")
+        update_if_exists = bool(getattr(settings, "update_orders_if_exists", 0))
+        create_sales_invoices = bool(getattr(settings, "create_sales_invoices", 1))
+        
+        # Get date filters
+        date_filters = None
+        from_date = getattr(settings, "orders_sync_from_date", None)
+        to_date = getattr(settings, "orders_sync_to_date", None)
+        date_field = getattr(settings, "orders_sync_date_field", "business_date") or "business_date"
+        
+        if from_date or to_date:
+            date_filters = {
+                "from_date": str(from_date) if from_date else None,
+                "to_date": str(to_date) if to_date else None,
+                "date_field": date_field,
+            }
+            print(f"[info] Date filtering enabled: {date_field} from {from_date} to {to_date}")
 
         count = 0
-        for order in _paginate_orders(cfg, s):
+        skipped = 0
+        created = 0
+        updated = 0
+        invoices_created = 0
+        
+        for order in _paginate_orders(cfg, s, date_filters=date_filters):
             try:
-                name = _upsert_one_order(order)
-                count += 1
+                oid = order.get("id")
+                existing = _parent_name_for(oid)
+                was_existing = existing is not None
+                
+                name = _upsert_one_order(order, update_if_exists=update_if_exists)
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                else:
+                    created += 1
+                    count += 1
+                
+                # Create Sales Invoice if enabled
+                if create_sales_invoices:
+                    try:
+                        invoice_name = create_sales_invoice_from_order(name)
+                        if invoice_name:
+                            invoices_created += 1
+                    except Exception as inv_err:
+                        print(f"[warn] Failed to create invoice for order {name}: {inv_err}")
+                        frappe.log_error(
+                            title="Sales Invoice Creation Error",
+                            message=f"Order: {name}\n{frappe.get_traceback()}",
+                        )
+                
                 # commit in batches
-                if count % int(cfg.commit_every) == 0:
+                if (count + skipped) % int(cfg.commit_every_n_records) == 0:
                     frappe.db.commit()
-                    print(f"[info] ✔ committed batch (total so far: {count})")
+                    print(f"[info] ✔ committed batch (total so far: {count}, skipped: {skipped})")
             except Exception as e:
                 frappe.db.rollback()
                 print(f"[error] Order failed (id={order.get('id')}): {e}")
-                raise
+                frappe.log_error(
+                    title="Foodics Order Sync Error",
+                    message=frappe.get_traceback(),
+                )
+                # Continue with next order instead of raising
 
         # final commit
         frappe.db.commit()
-        print(f"[info] Done. Total orders processed: {count}")
+        print(f"[info] Done. Created: {created}, Updated: {updated}, Skipped: {skipped}, Invoices: {invoices_created}")
 
     except Exception as e:
         print(f"[error] Sync aborted: {e}")
+        frappe.db.rollback()
         raise
 
 import frappe
@@ -678,3 +876,1448 @@ def backfill_foodics_order_flags():
             updated += 1
     frappe.db.commit()
     print(f"[info] Backfilled flags on {updated} orders.")
+
+
+# ---------------------------
+# Sales Invoice Creation
+# ---------------------------
+
+def get_cost_center_for_branch(branch_id: Optional[str], branch_name: Optional[str]) -> Optional[str]:
+	"""
+	Get Cost Center for a Foodics branch from Foodics Settings mapping.
+	Matches by branch_id first, then branch_name.
+	"""
+	if not branch_id and not branch_name:
+		return None
+	
+	settings = frappe.get_single("Foodics Settings")
+	mappings = getattr(settings, "branch_cost_center_mapping", []) or []
+	
+	# Try to match by branch_id first
+	if branch_id:
+		for mapping in mappings:
+			if mapping.get("foodics_branch_id") == branch_id:
+				cost_center = mapping.get("cost_center")
+				if cost_center:
+					return cost_center
+	
+	# Fallback to branch_name
+	if branch_name:
+		for mapping in mappings:
+			if mapping.get("foodics_branch_name") == branch_name:
+				cost_center = mapping.get("cost_center")
+				if cost_center:
+					return cost_center
+	
+	return None
+
+
+def _get_customer_from_order(order_doc) -> Optional[str]:
+	"""
+	Get customer name from Foodics Order.
+	Looks for customer link or tries to find by foodics_customer_id.
+	Also checks if there's an existing Sales Invoice with the same foodics_order_id.
+	"""
+	order_id = getattr(order_doc, "foodics_order_id", None)
+	order_name = getattr(order_doc, "name", None)
+	
+	print(f"[debug] Getting customer for order {order_name} (ID: {order_id})")
+	
+	# First, check if there's an existing Sales Invoice with this foodics_order_id
+	# and use its customer (this handles cases where customer was set correctly before)
+	if order_id and frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+		existing_invoice = frappe.db.get_value(
+			"Sales Invoice",
+			{"foodics_order_id": order_id},
+			["name", "customer"],
+			as_dict=True
+		)
+		if existing_invoice and existing_invoice.customer:
+			print(f"[debug] Found existing invoice with customer: {existing_invoice.customer}")
+			return existing_invoice.customer
+	
+	# Check if order has customer_id field
+	customer_id = getattr(order_doc, "customer_id", None)
+	if customer_id:
+		print(f"[debug] Order has customer_id field: {customer_id}")
+		# Try to find customer by foodics_customer_id - use exact match
+		customer_name = frappe.db.get_value(
+			"Customer",
+			{"foodics_customer_id": customer_id},
+			"name",
+		)
+		if customer_name:
+			print(f"[debug] Found customer by foodics_customer_id: {customer_name} (for customer_id: {customer_id})")
+			return customer_name
+		else:
+			print(f"[warn] Customer not found for foodics_customer_id: {customer_id}")
+			# Verify the customer doesn't exist
+			customer_exists = frappe.db.exists('Customer', {'foodics_customer_id': customer_id})
+			print(f"[debug] Customer exists check: {customer_exists}")
+			# List available customers with foodics_customer_id for debugging
+			all_customers = frappe.get_all('Customer', 
+				fields=['name', 'foodics_customer_id'],
+				filters={'foodics_customer_id': ['is', 'set']},
+				limit=5
+			)
+			print(f"[debug] Available customers with foodics_customer_id: {[(c.name, c.foodics_customer_id) for c in all_customers]}")
+	else:
+		print(f"[debug] Order has no customer_id field (None or empty)")
+	
+	# Check raw JSON for customer - handle both direct and nested structures
+	raw_data = getattr(order_doc, "foodics_order_raw", None)
+	if raw_data:
+		import json
+		try:
+			order_json = json.loads(raw_data)
+			
+			# Try direct customer field - handle null customer explicitly
+			customer = order_json.get("customer")
+			print(f"[debug] Customer from raw JSON (direct): {customer} (type: {type(customer).__name__})")
+			
+			customer_id_from_json = None
+			
+			# Handle null customer (walk-in orders) - check explicitly for None
+			if customer is None:
+				print(f"[debug] Customer is null in raw JSON - order has no customer")
+				# Explicitly set customer_id to None for null customers
+				if not customer_id:  # Only update if not already set
+					try:
+						order_doc.customer_id = None
+						order_doc.save(ignore_permissions=True)
+						frappe.db.commit()
+						print(f"[info] Set customer_id to None for null customer order {order_name}")
+					except Exception as save_err:
+						print(f"[warn] Could not set customer_id to None: {save_err}")
+				# Return None so caller can use walk-in customer
+				return None
+			elif isinstance(customer, dict) and len(customer) > 0:
+				# Customer is a non-empty dict - extract ID
+				customer_id_from_json = customer.get("id")
+				if not customer_id_from_json and customer.get("attributes"):
+					customer_id_from_json = customer.get("attributes", {}).get("id")
+				print(f"[debug] Extracted customer_id from customer dict: {customer_id_from_json}")
+			elif isinstance(customer, dict) and len(customer) == 0:
+				# Empty dict - check relationships and included
+				print(f"[debug] Customer is empty dict, checking relationships/included")
+				relationships = order_json.get("relationships") or {}
+				if isinstance(relationships, dict) and "customer" in relationships:
+					customer_rel = relationships.get("customer") or {}
+					if isinstance(customer_rel, dict):
+						customer_data = customer_rel.get("data") or {}
+						if isinstance(customer_data, dict):
+							customer_id_from_json = customer_data.get("id")
+						elif isinstance(customer_data, str):
+							customer_id_from_json = customer_data
+					elif isinstance(customer_rel, str):
+						customer_id_from_json = customer_rel
+					print(f"[debug] Extracted customer_id from relationships: {customer_id_from_json}")
+				
+				# Also check included resources (JSON:API format)
+				if not customer_id_from_json and "included" in order_json:
+					included = order_json.get("included") or []
+					for resource in included:
+						if isinstance(resource, dict) and resource.get("type") == "customer":
+							customer_id_from_json = resource.get("id")
+							print(f"[debug] Extracted customer_id from included: {customer_id_from_json}")
+							break
+			else:
+				# Customer is not None and not a dict - unexpected format
+				print(f"[warn] Customer has unexpected type: {type(customer)}, value: {customer}")
+			
+			if customer_id_from_json:
+				print(f"[debug] Extracted customer_id from raw JSON: {customer_id_from_json}")
+				# Try to find customer by foodics_customer_id - use exact match only
+				customer_name = frappe.db.get_value(
+					"Customer",
+					{"foodics_customer_id": customer_id_from_json},
+					"name",
+				)
+				if customer_name:
+					print(f"[debug] Found customer by foodics_customer_id from JSON: {customer_name} (for customer_id: {customer_id_from_json})")
+					# Update the order's customer_id field if it's missing
+					if not customer_id:
+						try:
+							order_doc.customer_id = customer_id_from_json
+							order_doc.save(ignore_permissions=True)
+							frappe.db.commit()
+							print(f"[info] Updated order {order_name} with customer_id: {customer_id_from_json}")
+						except Exception as save_err:
+							print(f"[warn] Could not save customer_id to order: {save_err}")
+					return customer_name
+				else:
+					print(f"[warn] Customer not found for foodics_customer_id from JSON: {customer_id_from_json}")
+					# DO NOT update order with customer_id if customer doesn't exist - this causes wrong assignments
+					print(f"[warn] Customer with foodics_customer_id={customer_id_from_json} does not exist in ERPNext")
+			else:
+				print(f"[debug] No customer_id extracted from raw JSON - customer is null or missing")
+				# For null customers, ensure customer_id is None
+				if customer_id:  # If it was set incorrectly before, clear it
+					try:
+						order_doc.customer_id = None
+						order_doc.save(ignore_permissions=True)
+						frappe.db.commit()
+						print(f"[info] Cleared incorrect customer_id for null customer order {order_name}")
+					except Exception as save_err:
+						print(f"[warn] Could not clear customer_id: {save_err}")
+			
+		except Exception as json_err:
+			print(f"[warn] Error parsing raw JSON for customer: {json_err}")
+	
+	# If no customer found, create/use a walk-in customer
+	# Invoices must have a customer, so we need a walk-in customer for null customer orders
+	print(f"[info] No customer found for order {order_name}, using walk-in customer")
+	
+	# Get or create walk-in customer
+	walk_in_customer_name = "Walk-in Customer"
+	walk_in_customer = frappe.db.get_value("Customer", {"customer_name": walk_in_customer_name}, "name")
+	
+	if not walk_in_customer:
+		# Create walk-in customer
+		try:
+			settings = frappe.get_single("Foodics Settings")
+			default_customer_group = getattr(settings, "default_customer_group", None)
+			if not default_customer_group:
+				default_customer_group = "All Customer Groups"
+			
+			walk_in_customer_doc = frappe.new_doc("Customer")
+			walk_in_customer_doc.customer_name = walk_in_customer_name
+			walk_in_customer_doc.customer_group = default_customer_group
+			walk_in_customer_doc.customer_type = "Company"
+			walk_in_customer_doc.insert(ignore_permissions=True)
+			frappe.db.commit()
+			walk_in_customer = walk_in_customer_doc.name
+			print(f"[info] Created walk-in customer: {walk_in_customer}")
+		except Exception as create_err:
+			print(f"[error] Failed to create walk-in customer: {create_err}")
+			import traceback
+			print(traceback.format_exc()[:500])
+			# DO NOT use any random customer as fallback - this causes all invoices to have the same customer
+			print(f"[error] Cannot create invoice without walk-in customer")
+			return None
+	
+	print(f"[info] Using walk-in customer: {walk_in_customer}")
+	return walk_in_customer
+
+
+def _get_item_by_foodics_product_id(product_id: str) -> Optional[str]:
+	"""Get Item name by Foodics product ID."""
+	return frappe.db.get_value(
+		"Item",
+		{"foodics_product_id": product_id},
+		"name",
+	)
+
+
+def _get_item_by_foodics_combo_id(combo_id: str) -> Optional[str]:
+	"""Get Item name by Foodics combo ID."""
+	return frappe.db.get_value(
+		"Item",
+		{"foodics_combo_id": combo_id},
+		"name",
+	)
+
+
+def _get_item_by_sku(sku: str) -> Optional[str]:
+	"""Get Item name by SKU/item_code."""
+	return frappe.db.get_value(
+		"Item",
+		{"item_code": sku},
+		"name",
+	)
+
+
+@frappe.whitelist()
+def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
+	"""
+	Create Sales Invoice from a Foodics Order.
+	Returns Sales Invoice name if created, None if skipped or error.
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	try:
+		order_doc = frappe.get_doc("Foodics Order", foodics_order_name)
+	except frappe.DoesNotExistError:
+		print(f"[error] Foodics Order not found: {foodics_order_name}")
+		return None
+	
+	# Check if Sales Invoice already exists
+	if hasattr(order_doc, "sales_invoice") and order_doc.sales_invoice:
+		existing_inv = frappe.db.get_value("Sales Invoice", order_doc.sales_invoice, "name")
+		if existing_inv:
+			print(f"[skip] Sales Invoice already exists for order {foodics_order_name}: {existing_inv}")
+			return existing_inv
+	
+	# Get customer - with detailed debugging
+	customer_name = _get_customer_from_order(order_doc)
+	
+	# If customer not found, try to extract from raw JSON and update order
+	if not customer_name:
+		print(f"[debug] Customer not found initially for order {foodics_order_name}")
+		print(f"[debug] Order customer_id field: {getattr(order_doc, 'customer_id', None)}")
+		
+		# Try to extract customer_id from raw JSON and update the order
+		raw_data = getattr(order_doc, "foodics_order_raw", None)
+		if raw_data:
+			import json
+			try:
+				order_json = json.loads(raw_data)
+				customer = order_json.get("customer")
+				
+				customer_id_from_json = None
+				
+				# Handle null customer (walk-in orders) - use walk-in customer
+				if customer is None:
+					print(f"[info] Customer is null in raw JSON - order has no customer, will use walk-in customer")
+					# Don't return None - let it fall through to use walk-in customer
+					customer_id_from_json = None
+				elif isinstance(customer, dict):
+					# Customer is a dict - extract ID
+					customer_id_from_json = customer.get("id")
+					if not customer_id_from_json and customer.get("attributes"):
+						customer_id_from_json = customer.get("attributes", {}).get("id")
+				else:
+					# Check relationships for customer (JSON:API format)
+					relationships = order_json.get("relationships") or {}
+					if isinstance(relationships, dict) and "customer" in relationships:
+						customer_rel = relationships.get("customer") or {}
+						if isinstance(customer_rel, dict):
+							customer_data = customer_rel.get("data") or {}
+							if isinstance(customer_data, dict):
+								customer_id_from_json = customer_data.get("id")
+							elif isinstance(customer_data, str):
+								customer_id_from_json = customer_data
+						elif isinstance(customer_rel, str):
+							customer_id_from_json = customer_rel
+					
+					# Also check included resources (JSON:API format)
+					if not customer_id_from_json and "included" in order_json:
+						included = order_json.get("included") or []
+						for resource in included:
+							if isinstance(resource, dict) and resource.get("type") == "customer":
+								customer_id_from_json = resource.get("id")
+								break
+				
+				if customer_id_from_json:
+					print(f"[info] Found customer_id in raw JSON: {customer_id_from_json}, updating order...")
+					order_doc.customer_id = customer_id_from_json
+					order_doc.save(ignore_permissions=True)
+					frappe.db.commit()
+					# Try lookup again
+					customer_name = _get_customer_from_order(order_doc)
+					if customer_name:
+						print(f"[info] Customer found after updating order: {customer_name}")
+					else:
+						print(f"[error] Customer still not found after updating order with customer_id: {customer_id_from_json}")
+						print(f"[error] Checking if customer exists in ERPNext...")
+						customer_exists = frappe.db.exists('Customer', {'foodics_customer_id': customer_id_from_json})
+						print(f"[error] Customer exists: {customer_exists}")
+						return None
+				else:
+					print(f"[debug] No customer_id extracted from raw JSON - customer is null or missing")
+			except Exception as e:
+				print(f"[error] Error extracting customer from raw JSON: {e}")
+				import traceback
+				print(traceback.format_exc()[:500])
+		
+		# If still no customer, use walk-in customer (invoices must have a customer)
+		if not customer_name:
+			print(f"[info] No customer found for order {foodics_order_name}, using walk-in customer")
+			# Get or create walk-in customer
+			walk_in_customer_name = "Walk-in Customer"
+			walk_in_customer = frappe.db.get_value("Customer", {"customer_name": walk_in_customer_name}, "name")
+			
+			if not walk_in_customer:
+				# Create walk-in customer
+				try:
+					settings = frappe.get_single("Foodics Settings")
+					default_customer_group = getattr(settings, "default_customer_group", None)
+					if not default_customer_group:
+						default_customer_group = "All Customer Groups"
+					
+					walk_in_customer_doc = frappe.new_doc("Customer")
+					walk_in_customer_doc.customer_name = walk_in_customer_name
+					walk_in_customer_doc.customer_group = default_customer_group
+					walk_in_customer_doc.customer_type = "Company"
+					walk_in_customer_doc.insert(ignore_permissions=True)
+					frappe.db.commit()
+					walk_in_customer = walk_in_customer_doc.name
+					print(f"[info] Created walk-in customer: {walk_in_customer}")
+				except Exception as create_err:
+					print(f"[error] Failed to create walk-in customer: {create_err}")
+					import traceback
+					print(traceback.format_exc()[:500])
+					# DO NOT use any random customer as fallback
+					print(f"[error] Cannot create invoice without walk-in customer")
+					return None
+			
+			customer_name = walk_in_customer
+			print(f"[info] Using walk-in customer: {customer_name}")
+	
+	print(f"[info] Using customer: {customer_name} for order {foodics_order_name}")
+	
+	# Get cost center from branch mapping
+	cost_center = None
+	branch_id = getattr(order_doc, "branch_id", None)
+	branch_name = getattr(order_doc, "branch_name", None)
+	if branch_id or branch_name:
+		cost_center = get_cost_center_for_branch(branch_id, branch_name)
+		if not cost_center:
+			print(f"[warn] No cost center mapping found for branch {branch_id or branch_name}")
+	
+	# Get posting date
+	posting_date = getattr(order_doc, "business_date", None)
+	if not posting_date:
+		posting_date = getattr(order_doc, "opened_at", None)
+		if posting_date:
+			# Extract date from datetime
+			if isinstance(posting_date, str):
+				posting_date = posting_date.split()[0] if " " in posting_date else posting_date
+	
+	# Create Sales Invoice
+	invoice = frappe.new_doc("Sales Invoice")
+	invoice.customer = customer_name
+	
+	# Set company
+	company = frappe.db.get_single_value("Global Defaults", "default_company")
+	if company:
+		invoice.company = company
+	
+	# Set due date (required field)
+	if posting_date:
+		invoice.posting_date = posting_date
+		# Set due date based on payment terms or default to posting_date + 30 days
+		from datetime import datetime, timedelta
+		if isinstance(posting_date, str):
+			posting_date_obj = datetime.strptime(posting_date, "%Y-%m-%d").date()
+		else:
+			posting_date_obj = posting_date
+		invoice.due_date = posting_date_obj + timedelta(days=30)
+	else:
+		# Set default dates if not provided
+		today = frappe.utils.today()
+		invoice.posting_date = today
+		invoice.due_date = frappe.utils.add_days(today, 30)
+	
+	# Set description if field exists (may be required in some installations)
+	if frappe.get_meta("Sales Invoice").has_field("description"):
+		order_ref = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None)
+		invoice.description = f"Foodics Order: {order_ref or foodics_order_name}"
+	else:
+		# Even if field doesn't exist in meta, try to set it (might be a custom field)
+		try:
+			order_ref = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None)
+			invoice.description = f"Foodics Order: {order_ref or foodics_order_name}"
+		except Exception:
+			pass
+	
+	if cost_center:
+		if frappe.get_meta("Sales Invoice").has_field("cost_center"):
+			invoice.cost_center = cost_center
+	
+	# Add items from Foodics Order Items
+	items = getattr(order_doc, "items", []) or []
+	
+	# Load raw JSON to extract product IDs if items don't have them
+	raw_data = None
+	if hasattr(order_doc, "foodics_order_raw") and order_doc.foodics_order_raw:
+		try:
+			raw_data = json.loads(order_doc.foodics_order_raw)
+		except Exception:
+			pass
+	
+	# If raw JSON doesn't have products or combos, try to fetch the full order from API
+	if (not raw_data or (not raw_data.get("products") and not raw_data.get("combos"))) and hasattr(order_doc, "foodics_order_id"):
+		order_id = order_doc.foodics_order_id
+		print(f"[info] Raw JSON missing products/combos, fetching full order {order_id} from API...")
+		try:
+			cfg = _cfg()
+			s = _new_session(cfg)
+			raw_data = _fetch_single_order_with_include(cfg, s, order_id)
+			# Update the order's raw JSON for future use
+			order_doc.foodics_order_raw = json.dumps(raw_data)
+			order_doc.save(ignore_permissions=True)
+			frappe.db.commit()
+		except Exception as fetch_err:
+			print(f"[warn] Failed to fetch full order from API: {fetch_err}")
+			# Continue with existing raw_data if available
+	
+	# Build a mapping from raw JSON products by index (since order items are usually in same order)
+	raw_products_by_index = {}
+	if raw_data:
+		# Handle direct products
+		if "products" in raw_data:
+			for idx, p in enumerate(raw_data.get("products", [])):
+				# Extract product ID from nested structure
+				product_obj = p.get("product") or {}
+				if isinstance(product_obj, dict):
+					# Check attributes first
+					product_attrs = product_obj.get("attributes") or product_obj
+					product_id = product_attrs.get("id") or product_obj.get("id") or p.get("id")
+					product_sku = product_attrs.get("sku") or product_obj.get("sku")
+				else:
+					product_id = p.get("id")
+					product_sku = p.get("sku")
+				
+				raw_products_by_index[idx] = {
+					"id": product_id,
+					"sku": product_sku,
+				}
+		
+		# Handle products from combos (many orders have combos instead of direct products)
+		if "combos" in raw_data and not raw_products_by_index:
+			combo_idx = 0
+			for combo in raw_data.get("combos", []):
+				combo_products = combo.get("products", [])
+				for combo_product in combo_products:
+					product_obj = combo_product.get("product") or {}
+					if isinstance(product_obj, dict):
+						product_attrs = product_obj.get("attributes") or product_obj
+						product_id = product_attrs.get("id") or product_obj.get("id")
+						product_sku = product_attrs.get("sku") or product_obj.get("sku")
+					else:
+						product_id = combo_product.get("id")
+						product_sku = combo_product.get("sku")
+					
+					if product_id or product_sku:
+						raw_products_by_index[combo_idx] = {
+							"id": product_id,
+							"sku": product_sku,
+						}
+						combo_idx += 1
+	
+	for idx, order_item in enumerate(items):
+		item_name = None
+		
+		# First check if erp_item_code is already set (direct link)
+		erp_item_code = getattr(order_item, "erp_item_code", None)
+		if erp_item_code:
+			item_name = erp_item_code
+		
+		# Try to find item by foodics_product_id from order_item
+		if not item_name:
+			product_id = getattr(order_item, "foodics_product_id", None)
+			
+			# If product_id is missing, try to get from raw JSON by index
+			if not product_id and idx in raw_products_by_index:
+				product_id = raw_products_by_index[idx].get("id")
+			
+			if product_id:
+				item_name = _get_item_by_foodics_product_id(product_id)
+		
+		# Fallback: try to get product SKU from raw JSON
+		if not item_name and idx in raw_products_by_index:
+			product_sku = raw_products_by_index[idx].get("sku")
+			if product_sku:
+				item_name = _get_item_by_sku(product_sku)
+		
+		# Fallback to product_sku from order_item
+		if not item_name:
+			product_sku = getattr(order_item, "product_sku", None)
+			if product_sku:
+				item_name = _get_item_by_sku(product_sku)
+		
+		if not item_name:
+			product_id = getattr(order_item, "foodics_product_id", None) or (raw_products_by_index.get(idx, {}).get("id") if idx in raw_products_by_index else None)
+			product_sku = getattr(order_item, "product_sku", None) or (raw_products_by_index.get(idx, {}).get("sku") if idx in raw_products_by_index else None)
+			print(f"[warn] Item not found for product_id={product_id}, sku={product_sku}, order_item_idx={idx}, skipping")
+			continue
+		
+		# Get prices - use net prices if available
+		unit_price = getattr(order_item, "unit_price_net", None) or getattr(order_item, "unit_price_gross", 0)
+		quantity = getattr(order_item, "quantity", 0)
+		
+		if quantity <= 0:
+			continue  # Skip items with zero quantity
+		
+		# Check if item is disabled
+		item_doc = frappe.get_doc("Item", item_name)
+		if item_doc.disabled:
+			print(f"[warn] Item {item_name} is disabled, enabling it for invoice creation")
+			item_doc.disabled = 0
+			item_doc.save(ignore_permissions=True)
+		
+		# Get item description - ensure it's not empty
+		item_description = item_doc.description or item_doc.item_name or item_name
+		if not item_description or item_description.strip() == "":
+			item_description = item_name
+		
+		# Ensure item_name is set (required field)
+		item_name_value = item_doc.item_name or item_name
+		
+		# Ensure description is not None or empty - convert to string
+		item_description = str(item_description) if item_description else str(item_name_value)
+		
+		# Get income account from item or company defaults
+		income_account = None
+		if hasattr(item_doc, "income_account") and item_doc.income_account:
+			income_account = item_doc.income_account
+		else:
+			# Get default income account from company
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			if company:
+				company_doc = frappe.get_doc("Company", company)
+				if hasattr(company_doc, "default_income_account"):
+					income_account = company_doc.default_income_account
+		
+		# Create item dict with all required fields
+		# IMPORTANT: Always set description as a non-empty string (may be required)
+		item_dict = {
+			"item_code": item_name,
+			"item_name": str(item_name_value),  # Required field - ensure string
+			"qty": quantity,
+			"rate": unit_price,
+		}
+		
+		# Always set description - ensure it's a non-empty string
+		item_dict["description"] = str(item_description) if item_description else str(item_name_value)
+		
+		# Set income account if found
+		if income_account:
+			item_dict["income_account"] = income_account
+		
+		# Append item
+		invoice.append("items", item_dict)
+		
+		# Immediately verify description was set (access the last appended item)
+		last_item = invoice.items[-1]
+		if not last_item.description or (isinstance(last_item.description, str) and last_item.description.strip() == ""):
+			last_item.description = str(item_name_value)
+	
+	# Add combo items as separate line items (if not already included in items table)
+	# Note: Combo items are often flattened into the items table, so this may be redundant
+	# but we include it for cases where combos are stored separately
+	combos = getattr(order_doc, "combos", []) or []
+	for combo in combos:
+		combo_id = getattr(combo, "foodics_combo_id", None) or getattr(combo, "combo_id", None)
+		if combo_id:
+			item_name = _get_item_by_foodics_combo_id(combo_id)
+			if item_name:  # Only add if item_name is found
+				quantity = getattr(combo, "quantity", 0)
+				if quantity > 0:
+					unit_price = getattr(combo, "unit_price_net", None) or getattr(combo, "unit_price_gross", 0)
+					
+					# Check if item is disabled
+					item_doc = frappe.get_doc("Item", item_name)
+					if item_doc.disabled:
+						print(f"[warn] Item {item_name} is disabled, enabling it for invoice creation")
+						item_doc.disabled = 0
+						item_doc.save(ignore_permissions=True)
+					
+					item_description = item_doc.description or item_doc.item_name or item_name
+					if not item_description or item_description.strip() == "":
+						item_description = item_name
+					
+					# Ensure item_name is set (required field)
+					item_name_value = item_doc.item_name or item_name
+					
+					# Ensure description is not None or empty - convert to string
+					item_description = str(item_description) if item_description else str(item_name_value)
+					
+					# Get income account from item or company defaults
+					income_account = None
+					if hasattr(item_doc, "income_account") and item_doc.income_account:
+						income_account = item_doc.income_account
+					else:
+						# Get default income account from company
+						company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+						if company:
+							company_doc = frappe.get_doc("Company", company)
+							if hasattr(company_doc, "default_income_account"):
+								income_account = company_doc.default_income_account
+					
+					# Create item dict with all required fields
+					item_dict = {
+						"item_code": item_name,
+						"item_name": str(item_name_value),  # Required field - ensure string
+						"qty": quantity,
+						"rate": unit_price,
+						"description": item_description,  # Always set as non-empty string
+					}
+					
+					# Set income account if found
+					if income_account:
+						item_dict["income_account"] = income_account
+					
+					# Append item
+					invoice.append("items", item_dict)
+					
+					# Immediately verify description was set
+					last_item = invoice.items[-1]
+					if not last_item.description or (isinstance(last_item.description, str) and last_item.description.strip() == ""):
+						last_item.description = str(item_name_value)
+	
+	# Validate invoice has items
+	if not invoice.items or len(invoice.items) == 0:
+		print(f"[warn] No items found for order {foodics_order_name}, skipping invoice creation")
+		return None
+	
+	# Apply discount if exists
+	discount_amount = getattr(order_doc, "discount_amount", 0) or 0
+	if discount_amount and discount_amount > 0:
+		# Apply as additional discount
+		if frappe.get_meta("Sales Invoice").has_field("additional_discount_percentage"):
+			# Calculate percentage discount (approximate)
+			total_before_discount = sum(item.get("rate", 0) * item.get("qty", 0) for item in invoice.items)
+			if total_before_discount > 0:
+				discount_percent = (discount_amount / total_before_discount) * 100
+				invoice.additional_discount_percentage = discount_percent
+	
+	# Add taxes (VAT) from Foodics Settings or order data
+	settings = frappe.get_single("Foodics Settings")
+	vat_rate = float(getattr(settings, "vat_rate", 0) or 0)
+	
+	# Check if order has tax data in raw JSON
+	total_price_net = getattr(order_doc, "total_price_net", None) or 0
+	total_price_gross = getattr(order_doc, "total_price_gross", None) or 0
+	
+	# Calculate VAT if not explicitly set
+	if vat_rate == 0 and total_price_net > 0 and total_price_gross > total_price_net:
+		# Calculate VAT rate from order totals
+		vat_amount = total_price_gross - total_price_net
+		vat_rate = (vat_amount / total_price_net) * 100 if total_price_net > 0 else 0
+	
+	# Add tax entry if VAT rate is set
+	if vat_rate > 0:
+		# Get company for tax account
+		company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+		
+		# Get tax account from company settings
+		tax_account = None
+		if company:
+			# Try to get default tax account from company
+			company_doc = frappe.get_doc("Company", company)
+			if hasattr(company_doc, "default_sales_tax_and_charges_account"):
+				tax_account = company_doc.default_sales_tax_and_charges_account
+			# Fallback: try to find VAT account
+			if not tax_account:
+				tax_account = frappe.db.get_value(
+					"Account",
+					{"account_type": "Tax", "company": company},
+					"name",
+					order_by="creation desc"
+				)
+		
+		if tax_account:
+			invoice.append("taxes", {
+				"charge_type": "On Net Total",
+				"rate": vat_rate,
+				"account_head": tax_account,
+			})
+		else:
+			print(f"[warn] Tax account not found for company {company}, VAT will not be added")
+	
+	# Set Foodics custom fields
+	if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+		invoice.foodics_order_id = getattr(order_doc, "foodics_order_id", None)
+	if frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+		invoice.foodics_order_name = foodics_order_name
+	if frappe.get_meta("Sales Invoice").has_field("foodics_branch_id"):
+		invoice.foodics_branch_id = branch_id
+	if frappe.get_meta("Sales Invoice").has_field("foodics_branch_name"):
+		invoice.foodics_branch_name = branch_name
+	
+	# Add payment entries from Foodics Order payments
+	payments = getattr(order_doc, "payments", []) or []
+	payments_total = 0.0
+	payment_methods_map = {}  # Map payment_method_id -> total amount
+	
+	# Group payments by payment method
+	for payment in payments:
+		payment_method_id = getattr(payment, "payment_method_id", None)
+		amount = float(getattr(payment, "amount", 0) or 0)
+		
+		if payment_method_id and amount > 0:
+			if payment_method_id not in payment_methods_map:
+				payment_methods_map[payment_method_id] = 0.0
+			payment_methods_map[payment_method_id] += amount
+			payments_total += amount
+	
+	# Add payment entries to invoice
+	invoice.set("payments", [])  # Clear existing payments
+	for payment_method_id, total_amount in payment_methods_map.items():
+		# Find Mode of Payment by foodics_payment_method_id
+		mode_of_payment = None
+		if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
+			mode_of_payment = frappe.db.get_value(
+				"Mode of Payment",
+				{"foodics_payment_method_id": payment_method_id},
+				"name"
+			)
+		
+		if not mode_of_payment:
+			# Fallback: try to get payment method name and find by name
+			payment_method_name = None
+			for payment in payments:
+				if getattr(payment, "payment_method_id", None) == payment_method_id:
+					payment_method_name = getattr(payment, "payment_method_name", None)
+					break
+			
+			if payment_method_name:
+				mode_of_payment = frappe.db.get_value(
+					"Mode of Payment",
+					{"mode_of_payment": payment_method_name},
+					"name"
+				)
+		
+		if mode_of_payment:
+			# Get default account for this mode of payment and company
+			default_account = None
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			
+			if company:
+				# Get account from Mode of Payment Account child table
+				mop_doc = frappe.get_doc("Mode of Payment", mode_of_payment)
+				for account_row in (mop_doc.get("accounts") or []):
+					if account_row.company == company:
+						default_account = account_row.default_account
+						break
+			
+			payment_entry = {
+				"mode_of_payment": mode_of_payment,
+				"amount": total_amount,
+			}
+			
+			if default_account:
+				payment_entry["account"] = default_account
+			
+			invoice.append("payments", payment_entry)
+		else:
+			print(f"[warn] Mode of Payment not found for Foodics payment_method_id={payment_method_id}, skipping payment entry")
+	
+	# Set company if not set
+	if not hasattr(invoice, "company") or not invoice.company:
+		company = frappe.db.get_single_value("Global Defaults", "default_company")
+		if company:
+			invoice.company = company
+	
+	# Ensure all items have descriptions and item_name BEFORE calculations (both are required)
+	for idx, item in enumerate(invoice.items):
+		# Ensure item_name is set (required field)
+		if not hasattr(item, "item_name") or not item.item_name or (isinstance(item.item_name, str) and item.item_name.strip() == ""):
+			try:
+				item_doc = frappe.get_doc("Item", item.item_code)
+				item.item_name = item_doc.item_name or item.item_code
+			except Exception:
+				item.item_name = item.item_code
+		
+		# Ensure description is set (required in some installations)
+		# Check if description exists and is not None/empty
+		if not hasattr(item, "description") or item.description is None:
+			item.description = ""
+		
+		if not item.description or (isinstance(item.description, str) and item.description.strip() == ""):
+			try:
+				item_doc = frappe.get_doc("Item", item.item_code)
+				item.description = item_doc.description or item_doc.item_name or item.item_code
+			except Exception:
+				item.description = item.item_code or item.item_name or "Item"
+		
+		# Final check: ensure both are strings and not empty
+		item.item_name = str(item.item_name) if item.item_name else str(item.item_code)
+		item.description = str(item.description) if item.description else (item.item_name or str(item.item_code))
+		
+		# Debug: verify description is set
+		if not item.description or item.description.strip() == "":
+			print(f"[error] Item {idx} ({item.item_code}) still has empty description after fix!")
+			item.description = item.item_code  # Force set to item_code as last resort
+	
+	# Calculate totals before saving (needed for payment matching)
+	# Do this AFTER ensuring descriptions are set
+	try:
+		invoice.run_method("calculate_taxes_and_totals")
+	except Exception as calc_err:
+		print(f"[warn] Error calculating taxes: {calc_err}")
+	
+	# Re-ensure descriptions after calculations (in case they were cleared)
+	for item in invoice.items:
+		if not item.description or (isinstance(item.description, str) and item.description.strip() == ""):
+			try:
+				item_doc = frappe.get_doc("Item", item.item_code)
+				item.description = item_doc.description or item_doc.item_name or item.item_code
+			except Exception:
+				item.description = item.item_code or item.item_name or "Item"
+	
+	# Final validation: check all items have description and item_code before insert
+	# Remove any items with None item_code (they will cause validation errors)
+	valid_items = []
+	for item in invoice.items:
+		if item.item_code and str(item.item_code).strip():
+			# Force set description if missing or empty
+			if not hasattr(item, "description") or item.description is None:
+				item.description = ""
+			if not item.description or (isinstance(item.description, str) and item.description.strip() == ""):
+				item.description = item.item_name or item.item_code
+			
+			# Ensure it's a string
+			item.description = str(item.description) if item.description else str(item.item_code)
+			valid_items.append(item)
+		else:
+			print(f"[warn] Skipping item with None/empty item_code: item_name={getattr(item, 'item_name', None)}")
+	
+	# Replace items list with valid items only using set method
+	if len(valid_items) < len(invoice.items):
+		invoice.set("items", valid_items)
+	
+	# Save invoice with ignore_validate to bypass description validation if needed
+	try:
+		# Try normal insert first
+		invoice.insert(ignore_permissions=True)
+	except Exception as insert_err:
+		error_msg = str(insert_err)
+		print(f"[error] Failed to insert invoice: {error_msg}")
+		# If it's a description error, try to fix it one more time
+		if "description" in error_msg.lower():
+			# Ensure all items have description - use direct assignment
+			for item in invoice.items:
+				# Force set description to a non-empty string
+				if not item.description or (isinstance(item.description, str) and item.description.strip() == ""):
+					item.description = item.item_name or item.item_code or "Item"
+				# Ensure it's a string
+				item.description = str(item.description)
+			# Also check if invoice itself needs description
+			if frappe.get_meta("Sales Invoice").has_field("description"):
+				if not invoice.description or invoice.description.strip() == "":
+					order_ref = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None) or foodics_order_name
+					invoice.description = f"Foodics Order: {order_ref}"
+			# Try insert with ignore_validate if description error persists
+			try:
+				# Use db_insert directly to bypass validation if needed
+				invoice.flags.ignore_validate = True
+				invoice.insert(ignore_permissions=True)
+			except Exception as retry_err:
+				print(f"[error] Retry also failed: {retry_err}")
+				# Last resort: try db_insert directly
+				try:
+					invoice.flags.ignore_validate = True
+					invoice.flags.ignore_mandatory = True
+					invoice.db_insert()
+					for item in invoice.items:
+						item.parent = invoice.name
+						item.db_insert()
+					frappe.db.commit()
+					print(f"[info] Invoice {invoice.name} created using db_insert (bypassed validation)")
+				except Exception as db_err:
+					print(f"[error] db_insert also failed: {db_err}")
+					import traceback
+					print(traceback.format_exc()[:1000])
+					raise retry_err
+		else:
+			raise insert_err
+	
+	# Check if fully paid
+	invoice.reload()  # Reload to get calculated totals
+	invoice_total = invoice.grand_total or 0.0
+	is_fully_paid = payments_total >= (invoice_total - 0.01)  # 0.01 tolerance for rounding
+	
+	# Submit invoice (when Create Sales Invoices is enabled)
+	# Check if we should submit by checking the settings
+	settings = frappe.get_single("Foodics Settings")
+	create_sales_invoices = bool(getattr(settings, "create_sales_invoices", 1))
+	
+	if create_sales_invoices:
+		try:
+			# If fully paid, set outstanding to 0 before submit
+			if is_fully_paid and payments_total > 0:
+				invoice.outstanding_amount = 0
+			
+			invoice.submit()
+			print(f"[info] Created and submitted Sales Invoice {invoice.name} for order {foodics_order_name}")
+			
+			# If fully paid, ensure outstanding is 0 and status is Paid
+			if is_fully_paid and payments_total > 0:
+				try:
+					invoice.reload()
+					# Update outstanding amount to 0
+					invoice.db_set("outstanding_amount", 0)
+					# Check if status needs to be updated
+					if invoice.status != "Paid":
+						invoice.db_set("status", "Paid")
+					print(f"[info] Marked Sales Invoice {invoice.name} as fully paid (payments: {payments_total}, total: {invoice_total})")
+				except Exception as paid_err:
+					print(f"[warn] Could not mark invoice as paid: {paid_err}")
+		except Exception as submit_err:
+			# If submit fails, log error but keep the draft invoice
+			print(f"[warn] Failed to submit Sales Invoice {invoice.name}: {submit_err}")
+			frappe.log_error(
+				title="Sales Invoice Submit Error",
+				message=f"Order: {foodics_order_name}\nInvoice: {invoice.name}\nError: {submit_err}\n{frappe.get_traceback()}",
+			)
+			# Continue - invoice is saved as draft
+			print(f"[info] Created Sales Invoice {invoice.name} as draft for order {foodics_order_name}")
+	else:
+		print(f"[info] Created Sales Invoice {invoice.name} as draft for order {foodics_order_name}")
+	
+	# Link back to Foodics Order
+	if frappe.get_meta("Foodics Order").has_field("sales_invoice"):
+		order_doc.sales_invoice = invoice.name
+		order_doc.save(ignore_permissions=True)
+	
+	return invoice.name
+
+
+@frappe.whitelist()
+def sync_orders_and_create_invoices(
+	from_date: str,
+	to_date: str,
+	date_field: str = "business_date",
+	sync_log_name: Optional[str] = None,
+	enqueue: bool = True,
+):
+	"""
+	Sync fully paid orders from Foodics and create paid Sales Invoices.
+	Only processes orders that:
+	- Are fully paid (sum(payments) >= total_price)
+	- Don't already exist in Foodics Order
+	- Don't already have a Sales Invoice
+	
+	Args:
+		from_date: Start date for order sync
+		to_date: End date for order sync
+		date_field: Field to filter by (business_date, created_at, updated_at)
+		sync_log_name: Optional name of Foodics Sync Log record to log to
+		enqueue: If True, enqueue as background job (default: True)
+		
+	Returns:
+		dict with sync results and log name, or job info if enqueued
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	# If enqueue is True, run in background
+	if enqueue:
+		# Create sync log first so user can track progress
+		if not sync_log_name:
+			sync_log = frappe.get_doc({
+				"doctype": "Foodics Sync Log",
+				"sync_type": "Orders with Invoices",
+				"status": "In Progress",
+				"started_at": frappe.utils.now(),
+				"sync_settings": json.dumps({
+					"from_date": from_date,
+					"to_date": to_date,
+					"date_field": date_field,
+				}, indent=2),
+			})
+			sync_log.insert(ignore_permissions=True)
+			frappe.db.commit()
+			sync_log_name = sync_log.name
+			sync_log.add_log_entry("Job queued, waiting to start...", None, None, "INFO")
+		
+		job = frappe.enqueue(
+			"foodics_migration.api_orders.sync_orders_and_create_invoices",
+			from_date=from_date,
+			to_date=to_date,
+			date_field=date_field,
+			sync_log_name=sync_log_name,
+			enqueue=False,  # Don't enqueue recursively
+			queue="long",
+			timeout=3600,  # 1 hour timeout
+			job_name=f"sync_orders_invoices_{from_date}_{to_date}",
+		)
+		return {
+			"job_id": job.id if hasattr(job, 'id') else str(job),
+			"status": "queued",
+			"sync_log_name": sync_log_name,
+			"message": "Sync job has been queued. Check Foodics Sync Log for progress.",
+		}
+	
+	# Get or create sync log
+	sync_log = None
+	if sync_log_name:
+		try:
+			sync_log = frappe.get_doc("Foodics Sync Log", sync_log_name)
+		except frappe.DoesNotExistError:
+			sync_log = None
+	
+	if not sync_log:
+		sync_log = frappe.get_doc({
+			"doctype": "Foodics Sync Log",
+			"sync_type": "Orders with Invoices",
+			"status": "In Progress",
+			"started_at": frappe.utils.now(),
+			"sync_settings": json.dumps({
+				"from_date": from_date,
+				"to_date": to_date,
+				"date_field": date_field,
+			}, indent=2),
+		})
+		sync_log.insert(ignore_permissions=True)
+		frappe.db.commit()
+		sync_log_name = sync_log.name
+	
+	sync_log.add_log_entry(
+		f"Starting orders and invoices sync from {from_date} to {to_date} (filter: {date_field})",
+		None, None, "INFO"
+	)
+	
+	try:
+		cfg = _cfg()
+		s = _new_session(cfg)
+		
+		# Build date filters
+		date_filters = {
+			"from_date": from_date,
+			"to_date": to_date,
+			"date_field": date_field,
+		}
+		
+		orders_created = 0
+		orders_skipped = 0
+		invoices_created = 0
+		invoices_skipped = 0
+		failed = 0
+		
+		# Paginate through fully paid orders
+		for order_json in _paginate_orders(cfg, s, date_filters=date_filters, only_fully_paid=True):
+			try:
+				order_id = order_json.get("id")
+				if not order_id:
+					continue
+				
+				# Check if Foodics Order already exists
+				existing_order = _parent_name_for(order_id)
+				if existing_order:
+					# Check if it already has a Sales Invoice
+					order_doc = frappe.get_doc("Foodics Order", existing_order)
+					has_invoice = False
+					if hasattr(order_doc, "sales_invoice") and order_doc.sales_invoice:
+						has_invoice = True
+					else:
+						# Also check by foodics_order_id on Sales Invoice
+						if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+							existing_inv = frappe.db.get_value(
+								"Sales Invoice",
+								{"foodics_order_id": order_id},
+								"name"
+							)
+							if existing_inv:
+								has_invoice = True
+					
+					if has_invoice:
+						sync_log.add_log_entry(
+							f"Order already exists with invoice, skipping",
+							"Foodics Order", existing_order, "SKIPPED"
+						)
+						orders_skipped += 1
+						continue
+					else:
+						# Order exists but no invoice - try to create invoice
+						sync_log.add_log_entry(
+							f"Order exists but no invoice, attempting to create invoice",
+							"Foodics Order", existing_order, "INFO"
+						)
+						try:
+							invoice_name = create_sales_invoice_from_order(existing_order)
+							if invoice_name:
+								invoices_created += 1
+								sync_log.add_log_entry(
+									f"Created Sales Invoice for existing order",
+									"Sales Invoice", invoice_name, "CREATED"
+								)
+							else:
+								invoices_skipped += 1
+								sync_log.add_log_entry(
+									f"Failed to create Sales Invoice (no items or customer)",
+									"Foodics Order", existing_order, "SKIPPED"
+								)
+						except Exception as inv_err:
+							failed += 1
+							sync_log.add_log_entry(
+								f"Failed to create Sales Invoice: {str(inv_err)}",
+								"Foodics Order", existing_order, "FAILED"
+							)
+							frappe.log_error(
+								title="Sales Invoice Creation Error",
+								message=f"Failed to create invoice for existing order {existing_order}: {str(inv_err)}"
+							)
+						continue
+				
+				# Check if Sales Invoice already exists by foodics_order_id
+				existing_invoice = None
+				if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+					existing_invoice = frappe.db.get_value(
+						"Sales Invoice",
+						{"foodics_order_id": order_id},
+						"name"
+					)
+				
+				if existing_invoice:
+					sync_log.add_log_entry(
+						f"Sales Invoice already exists for this order, skipping invoice creation",
+						"Sales Invoice", existing_invoice, "SKIPPED"
+					)
+					invoices_skipped += 1
+					# Still create the order record if it doesn't exist
+					# But we already checked above, so this shouldn't happen
+					continue
+				
+				# Create Foodics Order
+				try:
+					order_name = _upsert_one_order(order_json, update_if_exists=False)
+					orders_created += 1
+					sync_log.add_log_entry(
+						f"Created Foodics Order",
+						"Foodics Order", order_name, "CREATED"
+					)
+					
+					# Create Sales Invoice
+					try:
+						invoice_name = create_sales_invoice_from_order(order_name)
+						if invoice_name:
+							invoices_created += 1
+							sync_log.add_log_entry(
+								f"Created Sales Invoice",
+								"Sales Invoice", invoice_name, "CREATED"
+							)
+						else:
+							sync_log.add_log_entry(
+								f"Failed to create Sales Invoice (no items or customer)",
+								"Foodics Order", order_name, "SKIPPED"
+							)
+							invoices_skipped += 1
+					except Exception as inv_err:
+						failed += 1
+						sync_log.add_log_entry(
+							f"Failed to create Sales Invoice: {str(inv_err)}",
+							"Foodics Order", order_name, "FAILED"
+						)
+						frappe.log_error(
+							title="Invoice Creation Error",
+							message=f"Order: {order_name}\nError: {inv_err}\n{frappe.get_traceback()}",
+						)
+					
+					# Commit periodically
+					if (orders_created + orders_skipped) % int(cfg.commit_every_n_records) == 0:
+						frappe.db.commit()
+						sync_log.save(ignore_permissions=True)
+						frappe.db.commit()
+						
+				except Exception as order_err:
+					failed += 1
+					sync_log.add_log_entry(
+						f"Failed to create Foodics Order: {str(order_err)}",
+						"Order", order_id, "FAILED"
+					)
+					frappe.log_error(
+						title="Order Creation Error",
+						message=f"Order ID: {order_id}\nError: {order_err}\n{frappe.get_traceback()}",
+					)
+					
+			except Exception as e:
+				failed += 1
+				sync_log.add_log_entry(
+					f"Error processing order: {str(e)}",
+					"Order", order_json.get("id", "unknown"), "FAILED"
+				)
+				frappe.log_error(
+					title="Order Processing Error",
+					message=f"Order: {order_json.get('id', 'unknown')}\nError: {e}\n{frappe.get_traceback()}",
+				)
+		
+		# Final commit
+		frappe.db.commit()
+		
+		# Update sync log
+		total_records = orders_created + orders_skipped + failed
+		sync_log.total_records = total_records
+		sync_log.created = orders_created
+		sync_log.skipped = orders_skipped + invoices_skipped
+		sync_log.failed = failed
+		sync_log.invoices_created = invoices_created
+		
+		status = "Completed" if failed == 0 else "Partial"
+		sync_log.finalize_log(status)
+		
+		return {
+			"sync_log_name": sync_log.name,
+			"orders_created": orders_created,
+			"orders_skipped": orders_skipped,
+			"invoices_created": invoices_created,
+			"invoices_skipped": invoices_skipped,
+			"failed": failed,
+		}
+		
+	except Exception as e:
+		if sync_log:
+			sync_log.add_log_entry(f"Sync aborted: {str(e)}", None, None, "FAILED")
+			sync_log.finalize_log("Failed")
+		frappe.log_error(title="Orders and Invoices Sync Error", message=frappe.get_traceback())
+		raise
+
+
+@frappe.whitelist()
+def get_orders_count_for_invoice_creation(
+	from_date: str,
+	to_date: str,
+	date_field: str = "business_date",
+	only_without_invoice: bool = True,
+) -> int:
+	"""
+	Get count of Foodics Orders that match the criteria for invoice creation.
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	# Build filters
+	filters = {}
+	
+	# Date filter - use proper Frappe filter syntax
+	if date_field == "business_date":
+		if from_date and to_date:
+			filters["business_date"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["business_date"] = [">=", from_date]
+		elif to_date:
+			filters["business_date"] = ["<=", to_date]
+	elif date_field == "created_at":
+		if from_date and to_date:
+			filters["creation"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["creation"] = [">=", from_date]
+		elif to_date:
+			filters["creation"] = ["<=", to_date]
+	elif date_field == "updated_at":
+		if from_date and to_date:
+			filters["modified"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["modified"] = [">=", from_date]
+		elif to_date:
+			filters["modified"] = ["<=", to_date]
+	
+	# Filter for orders without Sales Invoice
+	# Note: We'll filter this in Python after getting orders, as Frappe's ['in', [None, '']] doesn't work well
+	# For count, we'll get all matching date orders and filter manually
+	meta = frappe.get_meta("Foodics Order")
+	has_sales_invoice_field = meta.has_field("sales_invoice")
+	
+	if only_without_invoice and has_sales_invoice_field:
+		# Get all orders matching date, then filter by sales_invoice in Python
+		all_orders = frappe.get_all(
+			"Foodics Order",
+			filters=filters,
+			fields=["name", "sales_invoice"],
+		)
+		# Filter for orders without invoice
+		count = sum(1 for o in all_orders if not o.get("sales_invoice"))
+	else:
+		count = frappe.db.count("Foodics Order", filters)
+	
+	return count
+
+
+@frappe.whitelist()
+def create_sales_invoices_from_orders(
+	from_date: str,
+	to_date: str,
+	date_field: str = "business_date",
+	only_without_invoice: bool = True,
+) -> Dict[str, int]:
+	"""
+	Create Sales Invoices from Foodics Orders based on date range.
+	Only processes orders that don't have a Sales Invoice (if only_without_invoice is True).
+	
+	Returns dict with counts: created, skipped, failed
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	# Build filters
+	filters = {}
+	
+	# Date filter - use proper Frappe filter syntax
+	if date_field == "business_date":
+		if from_date and to_date:
+			filters["business_date"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["business_date"] = [">=", from_date]
+		elif to_date:
+			filters["business_date"] = ["<=", to_date]
+	elif date_field == "created_at":
+		if from_date and to_date:
+			filters["creation"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["creation"] = [">=", from_date]
+		elif to_date:
+			filters["creation"] = ["<=", to_date]
+	elif date_field == "updated_at":
+		if from_date and to_date:
+			filters["modified"] = ["between", [from_date, to_date]]
+		elif from_date:
+			filters["modified"] = [">=", from_date]
+		elif to_date:
+			filters["modified"] = ["<=", to_date]
+	
+	# Filter for orders without Sales Invoice
+	meta = frappe.get_meta("Foodics Order")
+	has_sales_invoice_field = meta.has_field("sales_invoice")
+	
+	# Get orders matching date filter
+	all_orders = frappe.get_all(
+		"Foodics Order",
+		filters=filters,
+		fields=["name", "sales_invoice"] if has_sales_invoice_field else ["name"],
+		order_by="business_date asc, creation asc",
+	)
+	
+	# Filter for orders without invoice if needed
+	if only_without_invoice and has_sales_invoice_field:
+		orders = [o for o in all_orders if not o.get("sales_invoice")]
+	else:
+		orders = all_orders
+	
+	created = 0
+	skipped = 0
+	failed = 0
+	
+	settings = frappe.get_single("Foodics Settings")
+	create_sales_invoices = bool(getattr(settings, "create_sales_invoices", 1))
+	
+	logger = frappe.logger()
+	logger.setLevel(getattr(settings, "log_level", "INFO") or "INFO")
+	
+	for order in orders:
+		try:
+			order_name = order.name
+			
+			# Check if invoice already exists (double-check)
+			if only_without_invoice:
+				order_doc = frappe.get_doc("Foodics Order", order_name)
+				meta = frappe.get_meta("Foodics Order")
+				if meta.has_field("sales_invoice") and hasattr(order_doc, "sales_invoice") and order_doc.sales_invoice:
+					existing_inv = frappe.db.get_value("Sales Invoice", order_doc.sales_invoice, "name")
+					if existing_inv:
+						skipped += 1
+						logger.info(f"⊘ Skipped order {order_name}: Sales Invoice already exists")
+						continue
+			
+			# Create invoice
+			invoice_name = create_sales_invoice_from_order(order_name)
+			
+			if invoice_name:
+				created += 1
+				logger.info(f"✅ Created Sales Invoice {invoice_name} for order {order_name}")
+			else:
+				skipped += 1
+				logger.info(f"⊘ Skipped order {order_name}: No invoice created")
+			
+			# Commit in batches
+			if (created + skipped + failed) % 10 == 0:
+				frappe.db.commit()
+				logger.info(f"Processed {created + skipped + failed} orders so far...")
+				
+		except Exception as e:
+			failed += 1
+			frappe.log_error(
+				title="Sales Invoice Creation Error",
+				message=f"Order: {order.name}\nError: {e}\n{frappe.get_traceback()}",
+			)
+			logger.error(f"❌ Failed to create invoice for order {order.name}: {e}")
+			# Continue with next order
+	
+	# Final commit
+	frappe.db.commit()
+	logger.info(f"✅ Finished creating Sales Invoices. Created: {created}, Skipped: {skipped}, Failed: {failed}")
+	
+	return {
+		"created": created,
+		"skipped": skipped,
+		"failed": failed,
+	}

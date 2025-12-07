@@ -1,0 +1,248 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:foodics_order_id",
+ "creation": "2025-09-15 15:17:48.932654",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "foodics_order_id",
+  "reference",
+  "number",
+  "check_number",
+  "status",
+  "delivery_status",
+  "guests",
+  "business_date",
+  "opened_at",
+  "closed_at",
+  "subtotal_price_gross",
+  "total_price_gross",
+  "total_price_net",
+  "discount_amount",
+  "rounding_amount",
+  "branch_id",
+  "branch_name",
+  "device_id",
+  "device_name",
+  "creator_id",
+  "creator_name",
+  "closer_id",
+  "closer_name",
+  "column_break_lfnn",
+  "foodics_order_raw",
+  "items",
+  "combos",
+  "charges",
+  "payments",
+  "by_item",
+  "by_combos",
+  "charges_included",
+  "payments_included"
+ ],
+ "fields": [
+  {
+   "fieldname": "foodics_order_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Foodics Order ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "reference",
+   "fieldtype": "Data",
+   "label": "reference"
+  },
+  {
+   "fieldname": "number",
+   "fieldtype": "Int",
+   "label": "Number"
+  },
+  {
+   "fieldname": "check_number",
+   "fieldtype": "Int",
+   "label": "Check Number"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Int",
+   "label": "Status"
+  },
+  {
+   "fieldname": "delivery_status",
+   "fieldtype": "Int",
+   "label": "Delivery Status"
+  },
+  {
+   "fieldname": "guests",
+   "fieldtype": "Int",
+   "label": "Guests"
+  },
+  {
+   "fieldname": "business_date",
+   "fieldtype": "Date",
+   "label": "Business Date"
+  },
+  {
+   "fieldname": "opened_at",
+   "fieldtype": "Datetime",
+   "label": "Opened At"
+  },
+  {
+   "fieldname": "closed_at",
+   "fieldtype": "Datetime",
+   "label": "Closed At"
+  },
+  {
+   "fieldname": "subtotal_price_gross",
+   "fieldtype": "Currency",
+   "label": "Subtotal Gross"
+  },
+  {
+   "fieldname": "total_price_gross",
+   "fieldtype": "Currency",
+   "label": "Total Gross"
+  },
+  {
+   "fieldname": "total_price_net",
+   "fieldtype": "Currency",
+   "label": "Total Net"
+  },
+  {
+   "fieldname": "discount_amount",
+   "fieldtype": "Currency",
+   "label": "Discount Amount"
+  },
+  {
+   "fieldname": "rounding_amount",
+   "fieldtype": "Currency",
+   "label": "Rounding Amount"
+  },
+  {
+   "fieldname": "branch_id",
+   "fieldtype": "Data",
+   "label": "Branch ID"
+  },
+  {
+   "fieldname": "branch_name",
+   "fieldtype": "Data",
+   "label": "Branch Name"
+  },
+  {
+   "fieldname": "device_id",
+   "fieldtype": "Data",
+   "label": "Device ID"
+  },
+  {
+   "fieldname": "device_name",
+   "fieldtype": "Data",
+   "label": "Device Name"
+  },
+  {
+   "fieldname": "creator_id",
+   "fieldtype": "Data",
+   "label": "Creator ID"
+  },
+  {
+   "fieldname": "creator_name",
+   "fieldtype": "Data",
+   "label": "Creator Name"
+  },
+  {
+   "fieldname": "closer_id",
+   "fieldtype": "Data",
+   "label": "Closer ID"
+  },
+  {
+   "fieldname": "closer_name",
+   "fieldtype": "Data",
+   "label": "Closer Name"
+  },
+  {
+   "fieldname": "column_break_lfnn",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "foodics_order_raw",
+   "fieldtype": "Long Text",
+   "label": "Foodics Raw JSON"
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Items",
+   "options": "Foodics Order Item"
+  },
+  {
+   "fieldname": "combos",
+   "fieldtype": "Table",
+   "label": "combos",
+   "options": "Foodics Order Combo"
+  },
+  {
+   "fieldname": "charges",
+   "fieldtype": "Table",
+   "label": "charges",
+   "options": "Foodics Order Charge"
+  },
+  {
+   "fieldname": "payments",
+   "fieldtype": "Table",
+   "label": "payments",
+   "options": "Foodics Order Payment"
+  },
+  {
+   "default": "0",
+   "fieldname": "by_item",
+   "fieldtype": "Check",
+   "label": "by_item"
+  },
+  {
+   "default": "0",
+   "fieldname": "by_combos",
+   "fieldtype": "Check",
+   "label": "by_combos"
+  },
+  {
+   "default": "0",
+   "fieldname": "charges_included",
+   "fieldtype": "Check",
+   "label": "charges_included"
+  },
+  {
+   "default": "0",
+   "fieldname": "payments_included",
+   "fieldtype": "Check",
+   "label": "payments_included"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-12-07 16:28:52.382136",
+ "modified_by": "Administrator",
+ "module": "Foodics Migration",
+ "name": "Foodics Order",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

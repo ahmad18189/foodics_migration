@@ -77,12 +77,34 @@ def _get_with_backoff(s: requests.Session, url: str) -> Dict[str, Any]:
 
 # ---------- ITEM GROUP HELPER ----------
 
-def _ensure_item_group(name: str, parent: Optional[str] = "All Item Groups") -> str:
+def _ensure_item_group(name: str, parent: Optional[str] = "All Item Groups", foodics_category_id: Optional[str] = None, foodics_category_data: Optional[dict] = None) -> str:
     if not name:
         name = "Unassigned (Foodics)"
 
+    # Check by foodics_category_id first if provided
+    if foodics_category_id and frappe.get_meta("Item Group").has_field("foodics_category_id"):
+        existing = frappe.db.get_value(
+            "Item Group",
+            {"foodics_category_id": foodics_category_id},
+            "name",
+        )
+        if existing:
+            return existing
+
+    # Check by name
     existing = frappe.db.get_value("Item Group", {"item_group_name": name}, "name")
     if existing:
+        # Update with Foodics ID if not set
+        if foodics_category_id and frappe.get_meta("Item Group").has_field("foodics_category_id"):
+            try:
+                ig_doc = frappe.get_doc("Item Group", existing)
+                if not ig_doc.get("foodics_category_id"):
+                    ig_doc.foodics_category_id = foodics_category_id
+                if foodics_category_data and frappe.get_meta("Item Group").has_field("foodics_category_data"):
+                    ig_doc.foodics_category_data = json.dumps(foodics_category_data, ensure_ascii=False)
+                ig_doc.save(ignore_permissions=True)
+            except Exception:
+                pass
         return existing
 
     if parent and not frappe.db.exists("Item Group", parent):
@@ -100,6 +122,13 @@ def _ensure_item_group(name: str, parent: Optional[str] = "All Item Groups") -> 
         "is_group": 0,
         "parent_item_group": parent if frappe.db.exists("Item Group", parent) else None,
     })
+    
+    # Set Foodics fields if available
+    if foodics_category_id and frappe.get_meta("Item Group").has_field("foodics_category_id"):
+        doc.foodics_category_id = foodics_category_id
+    if foodics_category_data and frappe.get_meta("Item Group").has_field("foodics_category_data"):
+        doc.foodics_category_data = json.dumps(foodics_category_data, ensure_ascii=False)
+    
     doc.insert(ignore_permissions=True)
     print(f"    · created Item Group: {doc.name} (parent={parent})")
     return doc.name
@@ -386,7 +415,7 @@ def _rename_item_to_sku_if_needed(item_doc, sku: Optional[str]) -> None:
     item_doc.reload()
 
 
-def _upsert_combo_as_item(cfg: frappe._dict, combo: Dict[str, Any]) -> None:
+def _upsert_combo_as_item(cfg: frappe._dict, combo: Dict[str, Any], update_if_exists: bool = False) -> None:
     """
     Create/Update ERPNext Item from a Foodics Combo.
     - Use SKU as Item.item_code (fallback to combo.id if SKU is missing).
@@ -417,6 +446,9 @@ def _upsert_combo_as_item(cfg: frappe._dict, combo: Dict[str, Any]) -> None:
         item_name = frappe.db.get_value("Item", {"item_code": cid}, "name")
 
     if item_name:
+        if not update_if_exists:
+            print(f"[skip] Combo Item exists (update disabled): {item_name} (Foodics {cid})")
+            return
         item_doc = frappe.get_doc("Item", item_name)
     else:
         # Create new Item with item_code = SKU (or ID fallback)
@@ -441,8 +473,17 @@ def _upsert_combo_as_item(cfg: frappe._dict, combo: Dict[str, Any]) -> None:
         item_doc.item_name = combo.get("name")
 
     # Set Item Group from combo.category
-    cat_name = (combo.get("category") or {}).get("name")
-    ig = _ensure_item_group(cat_name or "Unassigned (Foodics)", parent="All Item Groups")
+    category = combo.get("category") or {}
+    cat_name = category.get("name")
+    cat_id = category.get("id")
+    
+    # Use local function to ensure Item Group with Foodics ID tracking
+    ig = _ensure_item_group(
+        cat_name or "Unassigned (Foodics)",
+        parent="All Item Groups",
+        foodics_category_id=cat_id,
+        foodics_category_data=category if category else None
+    )
     if item_doc.item_group != ig:
         item_doc.item_group = ig
         print(f"    · set item_group = {ig}")
@@ -481,15 +522,37 @@ def sync_foodics_combos():
     """
     cfg = _cfg()
     s = _new_session(cfg.token)
+    
+    # Get update setting from Foodics Settings
+    settings = frappe.get_single("Foodics Settings")
+    update_if_exists = bool(getattr(settings, "update_combos_if_exists", 0))
 
     processed = 0
+    skipped = 0
+    created = 0
+    updated = 0
     try:
         for combo in _iter_foodics_combos(cfg, s):
-            _upsert_combo_as_item(cfg, combo)
-            processed += 1
+            cid = (combo.get("id") or "").strip()
+            # Check if exists
+            item_name = None
+            if frappe.get_meta("Item").has_field("foodics_combo_id"):
+                item_name = frappe.db.get_value("Item", {"foodics_combo_id": cid}, "name")
+            was_existing = item_name is not None
+            
+            _upsert_combo_as_item(cfg, combo, update_if_exists=update_if_exists)
+            
+            if was_existing and not update_if_exists:
+                skipped += 1
+            elif was_existing:
+                updated += 1
+                processed += 1
+            else:
+                created += 1
+                processed += 1
 
         frappe.db.commit()
-        print(f"[info] Done. combos_processed={processed}")
+        print(f"[info] Done. Created: {created}, Updated: {updated}, Skipped: {skipped}")
 
     except Exception as e:
         frappe.db.rollback()

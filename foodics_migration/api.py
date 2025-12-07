@@ -11,15 +11,103 @@ from .utils import (
 )
 
 
-def _resolve_item_group_by_foodics_category_id(foodics_category_id: Optional[str]) -> str:
+def _resolve_item_group_by_foodics_category_id(foodics_category_id: Optional[str], category_data: Optional[dict] = None, update_if_exists: bool = False) -> str:
+    """
+    Resolve or create Item Group from Foodics category.
+    Returns Item Group name.
+    Always creates missing Item Groups with "All Item Groups" as parent.
+    """
     if not foodics_category_id:
         return "All Item Groups"
-    ig = frappe.db.get_value(
-        "Item Group",
-        filters={"foodics_category_id": foodics_category_id},
-        fieldname="name",
-    )
-    return ig or "All Item Groups"
+    
+    # Ensure "All Item Groups" exists
+    if not frappe.db.exists("Item Group", "All Item Groups"):
+        try:
+            frappe.get_doc({
+                "doctype": "Item Group",
+                "item_group_name": "All Item Groups",
+                "is_group": 1,
+                "parent_item_group": None,
+            }).insert(ignore_permissions=True)
+        except Exception:
+            pass  # May already exist
+    
+    # Check if Item Group exists by foodics_category_id
+    # Use get_value with proper field check
+    if frappe.get_meta("Item Group").has_field("foodics_category_id"):
+        ig = frappe.db.get_value(
+            "Item Group",
+            filters={"foodics_category_id": foodics_category_id},
+            fieldname="name",
+        )
+    else:
+        ig = None
+    
+    if ig:
+        # Update if enabled and category_data provided
+        if update_if_exists and category_data:
+            try:
+                ig_doc = frappe.get_doc("Item Group", ig)
+                if frappe.get_meta("Item Group").has_field("foodics_category_id"):
+                    ig_doc.foodics_category_id = foodics_category_id
+                if frappe.get_meta("Item Group").has_field("foodics_category_data"):
+                    ig_doc.foodics_category_data = json.dumps(category_data, ensure_ascii=False)
+                # Ensure parent is set correctly
+                if not ig_doc.parent_item_group or ig_doc.parent_item_group != "All Item Groups":
+                    ig_doc.parent_item_group = "All Item Groups"
+                ig_doc.save(ignore_permissions=True)
+            except Exception:
+                pass  # Continue if update fails
+        return ig
+    
+    # Create new Item Group if category_data provided or if we have category_id
+    category_name = None
+    if category_data:
+        category_name = category_data.get("name") or f"Category {foodics_category_id}"
+    else:
+        # If no category_data but we have category_id, create with a default name
+        category_name = f"Category {foodics_category_id}"
+    
+    if category_name:
+        try:
+            # Check if Item Group exists by name
+            existing_by_name = frappe.db.get_value("Item Group", {"item_group_name": category_name}, "name")
+            if existing_by_name:
+                # Update existing with Foodics ID and ensure parent is correct
+                ig_doc = frappe.get_doc("Item Group", existing_by_name)
+                if frappe.get_meta("Item Group").has_field("foodics_category_id"):
+                    ig_doc.foodics_category_id = foodics_category_id
+                if frappe.get_meta("Item Group").has_field("foodics_category_data") and category_data:
+                    ig_doc.foodics_category_data = json.dumps(category_data, ensure_ascii=False)
+                # Ensure parent is set correctly
+                if not ig_doc.parent_item_group or ig_doc.parent_item_group != "All Item Groups":
+                    ig_doc.parent_item_group = "All Item Groups"
+                ig_doc.save(ignore_permissions=True)
+                return ig_doc.name
+            else:
+                # Create new Item Group with "All Item Groups" as parent
+                ig_doc = frappe.get_doc({
+                    "doctype": "Item Group",
+                    "item_group_name": category_name,
+                    "parent_item_group": "All Item Groups",
+                    "is_group": 0,
+                })
+                if frappe.get_meta("Item Group").has_field("foodics_category_id"):
+                    ig_doc.foodics_category_id = foodics_category_id
+                if frappe.get_meta("Item Group").has_field("foodics_category_data") and category_data:
+                    ig_doc.foodics_category_data = json.dumps(category_data, ensure_ascii=False)
+                ig_doc.insert(ignore_permissions=True)
+                frappe.logger().info(f"＋ Created Item Group: {ig_doc.name} (Foodics {foodics_category_id}) with parent 'All Item Groups'")
+                return ig_doc.name
+        except Exception as e:
+            frappe.log_error(
+                title="Item Group Creation Error",
+                message=f"Failed to create Item Group for category {foodics_category_id}: {e}\n{frappe.get_traceback()}",
+            )
+            frappe.logger().error(f"❌ Failed to create Item Group for category {foodics_category_id}: {e}")
+    
+    # Fallback to default
+    return "All Item Groups"
 
 
 def _get_item_by_foodics_id(fid: str):
@@ -48,43 +136,46 @@ def _upsert_item_price(cfg: FoodicsConfig, item_code: str, rate: float):
     )
     doc = {
         "doctype": "Item Price",
-        "price_list": cfg.foodics_price_list,
         "item_code": item_code,
+        "price_list": cfg.foodics_price_list,
+        "price_list_rate": rate,
         "currency": cfg.foodics_currency,
-        "price_list_rate": float(rate or 0.0),
     }
     if existing_name:
-        ip = frappe.get_doc("Item Price", existing_name)
-        ip.update(doc)
-        ip.save(ignore_permissions=True)
-        frappe.logger().info(f"↻ Updated Item Price: {item_code} @ {rate}")
+        item_price = frappe.get_doc("Item Price", existing_name)
+        item_price.update(doc)
+        item_price.save(ignore_permissions=True)
     else:
         frappe.get_doc(doc).insert(ignore_permissions=True)
-        frappe.logger().info(f"＋ Created Item Price: {item_code} @ {rate}")
+
 
 def _replace_item_price(cfg: FoodicsConfig, item_code: str, gross_price: float):
-    # Calculate net (VAT exclusive)
-    vat_rate = getattr(cfg, "vat_rate", 0.15) or 0.0
-    net_price = round(float(gross_price or 0.0) / (1 + vat_rate), 2)
-
-    # Delete existing Item Prices for this item+pricelist
-    names = frappe.get_all(
+    """Replace Item Price with VAT-exclusive value."""
+    from foodics_migration.api_combo import _price_exclusive_from_inclusive
+    
+    vat_rate = getattr(frappe.get_single("Foodics Settings"), "vat_rate", 0.15)
+    net_price = _price_exclusive_from_inclusive(gross_price, vat_rate)
+    
+    existing_name = frappe.db.get_value(
         "Item Price",
         filters={"item_code": item_code, "price_list": cfg.foodics_price_list},
-        pluck="name",
+        fieldname="name",
     )
-    for n in names:
-        frappe.delete_doc("Item Price", n, ignore_permissions=True)
-
-    # Create fresh Item Price
-    doc = frappe.get_doc({
+    
+    doc = {
         "doctype": "Item Price",
-        "price_list": cfg.foodics_price_list,
         "item_code": item_code,
-        "currency": cfg.foodics_currency,
+        "price_list": cfg.foodics_price_list,
         "price_list_rate": net_price,
-    })
-    doc.insert(ignore_permissions=True)
+        "currency": cfg.foodics_currency,
+    }
+    
+    if existing_name:
+        item_price = frappe.get_doc("Item Price", existing_name)
+        item_price.update(doc)
+        item_price.save(ignore_permissions=True)
+    else:
+        frappe.get_doc(doc).insert(ignore_permissions=True)
 
     frappe.logger().info(f"↻ Replaced Item Price: {item_code} gross={gross_price} → net={net_price}")
 
@@ -100,7 +191,7 @@ def _disabled_flag(cfg: FoodicsConfig, product: dict) -> int:
     return 0
 
 
-def _upsert_item(cfg: FoodicsConfig, product: dict):
+def _upsert_item(cfg: FoodicsConfig, product: dict, update_if_exists: bool = False):
     fid = product.get("id")
     if not fid:
         return
@@ -110,8 +201,68 @@ def _upsert_item(cfg: FoodicsConfig, product: dict):
     maintain_stock = 1 if product.get("is_stock_product") else 0
     cost = float(product.get("cost") or 0.0)
     price = float(product.get("price") or 0.0)
+    
+    # Extract category - handle both direct object and nested structure
     category = product.get("category") or {}
-    item_group = _resolve_item_group_by_foodics_category_id(category.get("id"))
+    category_id = None
+    category_data = None
+    
+    # Debug: log the category structure
+    if product.get("category"):
+        frappe.logger().debug(f"Item {sku} category structure: {type(product.get('category'))} = {product.get('category')}")
+    
+    if category:
+        # Category might be a dict with id, or just an id string
+        if isinstance(category, dict):
+            category_id = category.get("id")
+            category_data = category
+            # Also check for nested category object
+            if not category_id and category.get("category"):
+                nested_cat = category.get("category")
+                if isinstance(nested_cat, dict):
+                    category_id = nested_cat.get("id")
+                    category_data = nested_cat
+        elif isinstance(category, str):
+            category_id = category
+        else:
+            # Try to get category_id directly from product
+            category_id = product.get("category_id")
+    
+    # If category_id is still None, try to get it from product directly
+    if not category_id:
+        category_id = product.get("category_id")
+    
+    # If we have category_id but no category_data, try to fetch it
+    if category_id and not category_data:
+        # Try to find existing Item Group to get the data
+        existing_ig = frappe.db.get_value(
+            "Item Group",
+            filters={"foodics_category_id": category_id},
+            fieldname=["name", "foodics_category_data"],
+            as_dict=True,
+        )
+        if existing_ig and existing_ig.get("foodics_category_data"):
+            try:
+                category_data = json.loads(existing_ig.get("foodics_category_data"))
+            except Exception:
+                pass
+    
+    # Resolve Item Group - will create if missing with "All Item Groups" as parent
+    item_group = _resolve_item_group_by_foodics_category_id(
+        category_id,
+        category_data=category_data if category_data else category if category else None,
+        update_if_exists=update_if_exists
+    )
+    
+    # Log if Item Group was created or if using default
+    if item_group == "All Item Groups":
+        if category_id:
+            frappe.logger().warning(f"⚠️ Item {sku} (Foodics {fid}): Category {category_id} found but Item Group resolution failed. Check if Item Groups were synced first.")
+        else:
+            frappe.logger().info(f"ℹ️ Item {sku} (Foodics {fid}): No category assigned in Foodics data, using default Item Group 'All Item Groups'")
+    elif category_id:
+        frappe.logger().debug(f"✓ Item {sku} (Foodics {fid}): Assigned to Item Group '{item_group}' (Category {category_id})")
+    
     disabled = _disabled_flag(cfg, product)
 
     payload = {
@@ -131,6 +282,9 @@ def _upsert_item(cfg: FoodicsConfig, product: dict):
 
     existing = _get_item_by_foodics_id(fid)
     if existing:
+        if not update_if_exists:
+            frappe.logger().info(f"⊘ Skipped Item (exists, update disabled): {sku} (Foodics {fid})")
+            return
         item = frappe.get_doc("Item", existing["name"])
         item.update(payload)
         item.save(ignore_permissions=True)
@@ -139,6 +293,9 @@ def _upsert_item(cfg: FoodicsConfig, product: dict):
     else:
         by_code = _get_item_by_item_code(sku)
         if by_code:
+            if not update_if_exists:
+                frappe.logger().info(f"⊘ Skipped Item (exists by code, update disabled): {sku}")
+                return
             item = frappe.get_doc("Item", by_code["name"])
             item.update(payload)
             item.save(ignore_permissions=True)
@@ -153,10 +310,98 @@ def _upsert_item(cfg: FoodicsConfig, product: dict):
     _replace_item_price(cfg, item_code, price)
 
 
+def _sync_item_groups_internal(cfg: FoodicsConfig, settings, update_if_exists: bool):
+    """
+    Internal function to sync Item Groups (called by sync_foodics_products).
+    """
+    logger = frappe.logger()
+    logger.setLevel(cfg.log_level)
+    session = make_foodics_session(cfg)
+    
+    count = 0
+    skipped = 0
+    created = 0
+    updated = 0
+    try:
+        for category in paginated_get(
+            cfg,
+            session,
+            endpoint="categories",
+            params=None,
+        ):
+            try:
+                category_id = category.get("id")
+                if not category_id:
+                    continue
+                
+                # Check if Item Group exists
+                existing = frappe.db.get_value(
+                    "Item Group",
+                    filters={"foodics_category_id": category_id},
+                    fieldname="name",
+                )
+                was_existing = existing is not None
+                
+                # Use the resolve function to create/update
+                item_group_name = _resolve_item_group_by_foodics_category_id(
+                    category_id,
+                    category_data=category,
+                    update_if_exists=update_if_exists
+                )
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                    logger.info(f"⊘ Skipped Item Group (exists, update disabled): {item_group_name} (Foodics {category_id})")
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                    logger.info(f"↻ Updated Item Group: {item_group_name} (Foodics {category_id})")
+                else:
+                    created += 1
+                    count += 1
+                    logger.info(f"＋ Created Item Group: {item_group_name} (Foodics {category_id})")
+                
+                # commit batching
+                if (count + skipped) % cfg.commit_every_n_records == 0:
+                    frappe.db.commit()
+            except Exception:
+                frappe.db.rollback()
+                frappe.log_error(
+                    title="Foodics Item Group Sync Error",
+                    message=frappe.get_traceback(),
+                )
+                # continue with next record
+        # final commit if remainder
+        frappe.db.commit()
+        logger.info(f"✅ Finished Foodics item groups sync. Created: {created}, Updated: {updated}, Skipped: {skipped}")
+    except Exception:
+        frappe.db.rollback()
+        raise
+
+
+@frappe.whitelist()
+def sync_foodics_item_groups():
+    """
+    Pull Foodics categories and upsert ERPNext Item Groups.
+    This should be run before syncing products.
+
+    Run via:
+      bench --site <yoursite> execute foodics_migration.api.sync_foodics_item_groups
+    """
+    frappe.only_for(("System Manager", "Administrator"))
+
+    cfg = load_foodics_settings()
+    settings = frappe.get_single("Foodics Settings")
+    update_if_exists = bool(getattr(settings, "update_products_if_exists", 0))
+    
+    _sync_item_groups_internal(cfg, settings, update_if_exists)
+
+
 @frappe.whitelist()
 def sync_foodics_products():
     """
     Pull Foodics products (with category) and upsert ERPNext Items & Item Prices.
+    This function will automatically sync Item Groups first if needed.
 
     Run via:
       bench --site <yoursite> execute foodics_migration.api.sync_foodics_products
@@ -166,10 +411,32 @@ def sync_foodics_products():
     cfg = load_foodics_settings()
     logger = frappe.logger()
     logger.setLevel(cfg.log_level)
+    
+    # Get update setting from Foodics Settings
+    settings = frappe.get_single("Foodics Settings")
+    update_if_exists = bool(getattr(settings, "update_products_if_exists", 0))
+
+    # First, sync Item Groups (categories) before syncing products
+    logger.info("🔄 Syncing Item Groups (categories) first...")
+    try:
+        # Call the sync function directly (not via whitelist to avoid permission issues)
+        _sync_item_groups_internal(cfg, settings, update_if_exists)
+        logger.info("✅ Item Groups sync completed. Proceeding with products sync...")
+        # Small delay to ensure Item Groups are committed
+        frappe.db.commit()
+    except Exception as e:
+        logger.warning(f"⚠️ Item Groups sync had issues, continuing with products: {e}")
+        frappe.log_error(
+            title="Foodics Item Group Sync Warning",
+            message=f"Item Group sync failed but continuing with products: {frappe.get_traceback()}",
+        )
 
     session = make_foodics_session(cfg)
 
     count = 0
+    skipped = 0
+    created = 0
+    updated = 0
     try:
         for prod in paginated_get(
             cfg,
@@ -178,10 +445,23 @@ def sync_foodics_products():
             params={"include": "category"},
         ):
             try:
-                _upsert_item(cfg, prod)
-                count += 1
+                fid = prod.get("id")
+                existing = _get_item_by_foodics_id(fid) if fid else None
+                was_existing = existing is not None
+                
+                _upsert_item(cfg, prod, update_if_exists=update_if_exists)
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                else:
+                    created += 1
+                    count += 1
+                
                 # commit batching
-                if count % cfg.commit_every_n_records == 0:
+                if (count + skipped) % cfg.commit_every_n_records == 0:
                     frappe.db.commit()
             except Exception:
                 frappe.db.rollback()
@@ -192,27 +472,11 @@ def sync_foodics_products():
                 # continue with next record
         # final commit if remainder
         frappe.db.commit()
-        logger.info(f"✅ Finished Foodics products sync. Processed: {count}")
+        logger.info(f"✅ Finished Foodics products sync. Created: {created}, Updated: {updated}, Skipped: {skipped}")
     except Exception:
         frappe.db.rollback()
         raise
 
-# --- append to api.py ---
-
-from frappe.utils import now_datetime
-
-from .utils import (
-    FoodicsConfig,
-    load_foodics_settings,
-    make_foodics_session,
-    paginated_get,
-    ensure_custom_fields_for_foodics,
-    assert_settings_for_parties,
-)
-
-# ---------------------------
-# Helpers (lookups & builders)
-# ---------------------------
 
 def _get_customer_by_foodics_id(fid: str):
     return frappe.db.get_value(
@@ -222,6 +486,7 @@ def _get_customer_by_foodics_id(fid: str):
         as_dict=True,
     )
 
+
 def _get_address_by_foodics_id(aid: str):
     return frappe.db.get_value(
         "Address",
@@ -230,20 +495,25 @@ def _get_address_by_foodics_id(aid: str):
         as_dict=True,
     )
 
+
 def _safe_str(*vals) -> str:
+    """Return first non-empty string from vals, or empty string."""
     for v in vals:
         if v:
-            v = str(v).strip()
-            if v:
-                return v
+            s = str(v).strip()
+            if s:
+                return s
     return ""
+
 
 def _extract_customer_name(c: dict) -> str:
     # Prefer explicit name; otherwise fallback to id
     return _safe_str(c.get("name"), c.get("first_name"), c.get("last_name"), c.get("id"))
 
+
 def _extract_address_title(addr: dict, cust_name: str) -> str:
     return _safe_str(addr.get("name"), addr.get("label"), addr.get("nickname"), f"{cust_name} Address")
+
 
 def _extract_address_line1(addr: dict) -> str:
     # NO PII policy: we still need a line to save Address. Prefer generic text if specifics are missing.
@@ -255,10 +525,12 @@ def _extract_address_line1(addr: dict) -> str:
         "Address from Foodics",
     )
 
+
 def _extract_city_country(addr: dict, default_city: str, default_country: str):
     city = _safe_str(addr.get("city"), default_city)
     country = _safe_str(addr.get("country"), default_country)
     return city, country
+
 
 def _extract_delivery_zone(addr: dict) -> str:
     dz = addr.get("delivery_zone") or {}
@@ -266,11 +538,12 @@ def _extract_delivery_zone(addr: dict) -> str:
         return _safe_str(dz.get("name"), dz.get("id"))
     return _safe_str(dz)
 
+
 # ---------------------------
 # Upsert functions
 # ---------------------------
 
-def _upsert_customer(cfg: FoodicsConfig, s, cust: dict) -> str:
+def _upsert_customer(cfg: FoodicsConfig, s, cust: dict, update_if_exists: bool = False) -> str:
     """
     Returns ERPNext Customer name.
     - 1:1 strict mapping
@@ -281,6 +554,7 @@ def _upsert_customer(cfg: FoodicsConfig, s, cust: dict) -> str:
     if not fid:
         return ""
 
+    from frappe.utils import now_datetime
     now = now_datetime()
     doc_fields = {
         "doctype": "Customer",
@@ -298,6 +572,9 @@ def _upsert_customer(cfg: FoodicsConfig, s, cust: dict) -> str:
 
     existing = _get_customer_by_foodics_id(fid)
     if existing:
+        if not update_if_exists:
+            frappe.logger().info(f"⊘ Skipped Customer (exists, update disabled): {existing['name']} (Foodics {fid})")
+            return existing["name"]
         doc = frappe.get_doc("Customer", existing["name"])
         doc.update(doc_fields)
         doc.save(ignore_permissions=True)
@@ -307,6 +584,7 @@ def _upsert_customer(cfg: FoodicsConfig, s, cust: dict) -> str:
         doc = frappe.get_doc(doc_fields).insert(ignore_permissions=True)
         frappe.logger().info(f"＋ Created Customer: {doc.name} (Foodics {fid})")
         return doc.name
+
 
 def _upsert_address(cfg: FoodicsConfig, s, addr: dict, customer_name: str) -> str:
     """
@@ -319,6 +597,7 @@ def _upsert_address(cfg: FoodicsConfig, s, addr: dict, customer_name: str) -> st
     if not aid:
         return ""
 
+    from frappe.utils import now_datetime
     city, country = _extract_city_country(addr, s.address_city_default or "Al Riyadh", s.address_country_default or "Saudi Arabia")
     title = _extract_address_title(addr, customer_name)
     line1 = _extract_address_line1(addr)
@@ -376,6 +655,7 @@ def sync_foodics_customers():
     frappe.only_for(("System Manager", "Administrator"))
 
     # Ensure custom fields exist before we do anything else
+    from foodics_migration.utils import ensure_custom_fields_for_foodics, assert_settings_for_parties
     ensure_custom_fields_for_foodics()
 
     cfg = load_foodics_settings()
@@ -385,22 +665,41 @@ def sync_foodics_customers():
     # Validate party-related settings
     assert_settings_for_parties(cfg)
     s = frappe.get_single("Foodics Settings")
+    
+    # Get update setting from Foodics Settings
+    update_if_exists = bool(getattr(s, "update_customers_if_exists", 0))
 
     session = make_foodics_session(cfg)
     count = 0
+    skipped = 0
+    created = 0
+    updated = 0
 
     try:
         for cust in paginated_get(cfg, session, endpoint="customers", params=None):
             try:
-                _upsert_customer(cfg, s, cust)
-                count += 1
-                if count % cfg.commit_every_n_records == 0:
+                fid = cust.get("id")
+                existing = _get_customer_by_foodics_id(fid) if fid else None
+                was_existing = existing is not None
+                
+                _upsert_customer(cfg, s, cust, update_if_exists=update_if_exists)
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                else:
+                    created += 1
+                    count += 1
+                
+                if (count + skipped) % cfg.commit_every_n_records == 0:
                     frappe.db.commit()
             except Exception:
                 frappe.db.rollback()
                 frappe.log_error(title="Foodics Customer Sync Error", message=frappe.get_traceback())
         frappe.db.commit()
-        logger.info(f"✅ Finished Foodics customer sync. Processed: {count}")
+        logger.info(f"✅ Finished Foodics customer sync. Created: {created}, Updated: {updated}, Skipped: {skipped}")
     except Exception:
         frappe.db.rollback()
         raise
@@ -409,14 +708,13 @@ def sync_foodics_customers():
 @frappe.whitelist()
 def sync_foodics_addresses():
     """
-    Sync Foodics Customer Addresses (1:1, minimal, no PII).
-    Expects customers to be synced first so we can link.
+    Sync Foodics Customer Addresses.
     Run via:
       bench --site <yoursite> execute foodics_migration.api.sync_foodics_addresses
     """
     frappe.only_for(("System Manager", "Administrator"))
 
-    # Ensure custom fields exist before we do anything else
+    from foodics_migration.utils import ensure_custom_fields_for_foodics, assert_settings_for_parties
     ensure_custom_fields_for_foodics()
 
     cfg = load_foodics_settings()
@@ -429,26 +727,22 @@ def sync_foodics_addresses():
     session = make_foodics_session(cfg)
     count = 0
 
-    # Foodics v5 commonly exposes customer addresses at 'customer_addresses'
-    # If your tenant uses a different path, just change `endpoint` below.
     try:
-        for addr in paginated_get(cfg, session, endpoint="customer_addresses", params=None):
+        for cust in paginated_get(cfg, session, endpoint="customers", params=None):
             try:
-                cust_id = _safe_str(addr.get("customer_id"))
-                if not cust_id:
-                    raise Exception("Address missing customer_id")
-                cust = _get_customer_by_foodics_id(cust_id)
-                if not cust:
-                    # if Customer missing, we create it on the fly with minimal info
-                    # or skip — here we choose to create minimally to preserve referential integrity
-                    customer_name = _upsert_customer(cfg, s, {"id": cust_id, "name": cust_id})
-                else:
-                    customer_name = cust["name"]
+                fid = cust.get("id")
+                customer_name = _get_customer_by_foodics_id(fid)
+                if not customer_name:
+                    frappe.logger().warning(f"Customer {fid} not found, skipping addresses")
+                    continue
+                customer_name = customer_name["name"]
 
-                _upsert_address(cfg, s, addr, customer_name)
-                count += 1
-                if count % cfg.commit_every_n_records == 0:
-                    frappe.db.commit()
+                addresses = cust.get("addresses") or []
+                for addr in addresses:
+                    _upsert_address(cfg, s, addr, customer_name)
+                    count += 1
+                    if count % cfg.commit_every_n_records == 0:
+                        frappe.db.commit()
             except Exception:
                 frappe.db.rollback()
                 frappe.log_error(title="Foodics Address Sync Error", message=frappe.get_traceback())
@@ -459,640 +753,643 @@ def sync_foodics_addresses():
         raise
 
 
-# foodics_migration/api.py
+# ---------------------------
+# Branch Fetching Functions
+# ---------------------------
 
-import json
-import time
-from urllib.parse import urlencode, urljoin
-
-import frappe
-import requests
-
-
-# -----------------------------
-# Settings & HTTP session
-# -----------------------------
-
-def _get_foodics_settings():
-    cfg = frappe.get_single("Foodics Settings")
-    missing = []
-    for k in ("foodics_base_url", "foodics_token", "foodics_per_page"):
-        if not getattr(cfg, k, None):
-            missing.append(k)
-    if missing:
-        frappe.throw(f"Foodics Settings missing: {', '.join(missing)}")
-
-    base = cfg.foodics_base_url.strip()
-    # Per your decision: do NOT auto-add scheme; fail if missing
-    if not (base.startswith("http://") or base.startswith("https://")):
-        frappe.throw("Foodics base URL must include scheme (http/https). Example: https://api.foodics.com/v5")
-
-    # ensure trailing slash handling works with urljoin
-    if not base.endswith("/"):
-        base = base + "/"
-
-    per_page = int(cfg.foodics_per_page or 100)
-    if per_page <= 0:
-        per_page = 100
-
-    return frappe._dict(
-        base_url=base,
-        token=cfg.foodics_token.strip(),
-        per_page=per_page,
-    )
-
-
-def _build_session(token: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    })
-    return s
-
-
-# -----------------------------
-# Schema guards (parent & child)
-# -----------------------------
-
-def _ensure_order_parent_schema(parent_dt="Foodics Order"):
-    """Make sure the parent has needed fields (we won’t create the doctype; just ensure custom fields)."""
-    parent_meta = frappe.get_meta(parent_dt)
-
-    def ensure_field(fieldname, label, fieldtype, options=None):
-        if not any(df.fieldname == fieldname for df in parent_meta.fields):
-            print(f"⚠ Parent {parent_dt} missing `{fieldname}` → creating it.")
-            frappe.get_doc({
-                "doctype": "Custom Field",
-                "dt": parent_dt,
-                "fieldname": fieldname,
-                "label": label,
-                "fieldtype": fieldtype,
-                "options": options,
-                "insert_after": parent_meta.fields[-1].fieldname if parent_meta.fields else "naming_series",
-            }).insert(ignore_permissions=True)
-            frappe.clear_cache(doctype=parent_dt)
-
-    # Minimal set used below
-    ensure_field("foodics_order_id", "Foodics Order ID", "Data")
-    ensure_field("number", "Number", "Int")
-    ensure_field("check_number", "Check Number", "Int")
-    ensure_field("status", "Status", "Int")
-    ensure_field("delivery_status", "Delivery Status", "Int")
-    ensure_field("guests", "Guests", "Int")
-    ensure_field("business_date", "Business Date", "Date")
-    ensure_field("opened_at", "Opened At", "Datetime")
-    ensure_field("closed_at", "Closed At", "Datetime")
-    ensure_field("subtotal_price_gross", "Subtotal Price (Gross)", "Currency")
-    ensure_field("total_price_gross", "Total Price (Gross)", "Currency")
-    ensure_field("total_price_net", "Total Price (Net)", "Currency")
-    ensure_field("discount_amount", "Discount Amount", "Currency")
-    ensure_field("rounding_amount", "Rounding Amount", "Currency")
-    ensure_field("branch_name", "Branch Name", "Data")
-    ensure_field("device_name", "Device Name", "Data")
-    ensure_field("creator_name", "Creator Name", "Data")
-    ensure_field("closer_name", "Closer Name", "Data")
-    ensure_field("foodics_order_raw", "Foodics Order Raw", "Long Text")
-
-
-def _ensure_order_items_schema(parent_dt="Foodics Order", child_dt="Foodics Order Item", child_fieldname="items"):
-    # Ensure parent has a child table named `items`
-    parent_meta = frappe.get_meta(parent_dt)
-    if not any(df.fieldtype == "Table" and df.fieldname == child_fieldname for df in parent_meta.fields):
-        print(f"⚠ Parent {parent_dt} missing child table field `{child_fieldname}` → creating it.")
-        frappe.get_doc({
-            "doctype": "Custom Field",
-            "dt": parent_dt,
-            "fieldname": child_fieldname,
-            "label": "Items",
-            "fieldtype": "Table",
-            "options": child_dt,
-            "insert_after": parent_meta.fields[-1].fieldname if parent_meta.fields else "naming_series",
-        }).insert(ignore_permissions=True)
-        frappe.clear_cache(doctype=parent_dt)
-
-    # Ensure child fields
-    child_meta = frappe.get_meta(child_dt)
-
-    def ensure_child_field(fieldname, label, fieldtype, options=None):
-        if not any(df.fieldname == fieldname for df in child_meta.fields):
-            print(f"⚠ Child {child_dt} missing `{fieldname}` → creating it.")
-            frappe.get_doc({
-                "doctype": "Custom Field",
-                "dt": child_dt,
-                "fieldname": fieldname,
-                "label": label,
-                "fieldtype": fieldtype,
-                "options": options,
-                "insert_after": child_meta.fields[-1].fieldname if child_meta.fields else "idx",
-            }).insert(ignore_permissions=True)
-            frappe.clear_cache(doctype=child_dt)
-
-    ensure_child_field("foodics_product_id", "Foodics Product ID", "Data")
-    ensure_child_field("product_sku", "SKU", "Data")
-    ensure_child_field("product_name", "Product Name", "Data")
-    ensure_child_field("category_id", "Category ID", "Data")
-    ensure_child_field("category_name", "Category Name", "Data")
-    ensure_child_field("qty", "Qty", "Float")
-    ensure_child_field("unit_price_gross", "Unit Price (Gross)", "Currency")
-    ensure_child_field("total_price_gross", "Total Price (Gross)", "Currency")
-    ensure_child_field("unit_price_net", "Unit Price (Net)", "Currency")
-    ensure_child_field("total_price_net", "Total Price (Net)", "Currency")
-    ensure_child_field("line_status", "Line Status", "Int")
-    ensure_child_field("kitchen_notes", "Kitchen Notes", "Small Text")
-    ensure_child_field("foodics_item_raw", "Foodics Item Raw", "Long Text")
-
-
-# -----------------------------
-# Mappers
-# -----------------------------
-
-def _map_parent_fields(doc, order_obj, raw_field="foodics_order_raw"):
-    # Basic fields
-    doc.foodics_order_id = order_obj.get("id")
-    doc.number = order_obj.get("number")
-    doc.check_number = order_obj.get("check_number")
-    doc.status = order_obj.get("status")
-    doc.delivery_status = order_obj.get("delivery_status")
-    doc.guests = order_obj.get("guests")
-
-    doc.business_date = order_obj.get("business_date")
-    doc.opened_at = order_obj.get("opened_at")
-    doc.closed_at = order_obj.get("closed_at")
-
-    # Prices
-    doc.subtotal_price_gross = order_obj.get("subtotal_price") or 0
-    doc.total_price_gross = order_obj.get("total_price") or 0
-
-    # total_price_net: sum of lines net if present; otherwise 0
-    total_net = 0.0
-    for line in (order_obj.get("products") or []):
-        total_net += float(line.get("tax_exclusive_total_price") or 0)
-    doc.total_price_net = total_net
-
-    doc.discount_amount = order_obj.get("discount_amount") or 0
-    doc.rounding_amount = order_obj.get("rounding_amount") or 0
-
-    # Lightweight branch/device/creator/closer names (for filterability)
-    branch = order_obj.get("branch") or {}
-    doc.branch_name = branch.get("name")
-
-    device = order_obj.get("device") or {}
-    doc.device_name = device.get("name")
-
-    creator = order_obj.get("creator") or {}
-    doc.creator_name = creator.get("name")
-
-    closer = order_obj.get("closer") or {}
-    doc.closer_name = closer.get("name")
-
-    # Raw JSON
+@frappe.whitelist()
+@frappe.whitelist()
+def fetch_foodics_branches():
+    """
+    Fetch branches from Foodics API for use in frontend/JavaScript.
+    Returns list of branches with id, name, and reference.
+    """
+    frappe.only_for(("System Manager", "Administrator"))
+    
+    cfg = load_foodics_settings()
+    session = make_foodics_session(cfg)
+    
+    branches = []
     try:
-        setattr(doc, raw_field, json.dumps(order_obj, ensure_ascii=False))
-    except Exception:
-        setattr(doc, raw_field, frappe.as_json(order_obj))
+        for branch in paginated_get(cfg, session, endpoint="branches", params=None):
+            # Handle JSON:API format - branch data might be in attributes
+            branch_id = branch.get("id")
+            branch_attrs = branch.get("attributes") or {}
+            
+            # Extract name - could be in attributes or directly in branch
+            branch_name = branch_attrs.get("name") or branch.get("name") or ""
+            branch_reference = branch_attrs.get("reference") or branch.get("reference") or ""
+            
+            branches.append({
+                "id": branch_id or branch_attrs.get("id") or "",
+                "name": branch_name,
+                "reference": branch_reference,
+            })
+        return branches
+    except Exception as e:
+        frappe.log_error(title="Foodics Branches Fetch Error", message=frappe.get_traceback())
+        frappe.throw(f"Error fetching branches: {str(e)}")
 
 
-def _map_child_items(doc, order_products, child_fieldname="items"):
-    if not order_products:
-        print("   • No products on this order; items cleared.")
-        doc.set(child_fieldname, [])
-        return
-
-    doc.set(child_fieldname, [])
-    added = 0
-    for line in order_products:
-        p = (line or {}).get("product") or {}
-        cat = p.get("category") or {}
-
-        ch = doc.append(child_fieldname, {})
-        ch.foodics_product_id = p.get("id")
-        ch.product_sku = p.get("sku")
-        ch.product_name = p.get("name")
-        ch.category_id = cat.get("id")
-        ch.category_name = cat.get("name")
-
-        ch.qty = line.get("quantity") or 0
-        ch.unit_price_gross = line.get("unit_price") or 0
-        ch.total_price_gross = line.get("total_price") or 0
-        ch.unit_price_net = line.get("tax_exclusive_unit_price") or 0
-        ch.total_price_net = line.get("tax_exclusive_total_price") or 0
-
-        ch.line_status = line.get("status") or 0
-        ch.kitchen_notes = line.get("kitchen_notes")
-
-        try:
-            ch.foodics_item_raw = json.dumps(line, ensure_ascii=False)
-        except Exception:
-            ch.foodics_item_raw = frappe.as_json(line)
-
-        added += 1
-
-    print(f"   • Added {added} item rows.")
+def get_foodics_branches():
+    """
+    Fetch branches from Foodics API (for bench execute).
+    Returns list of branches with id, name, and reference.
+    """
+    cfg = load_foodics_settings()
+    session = make_foodics_session(cfg)
+    
+    branches = []
+    try:
+        for branch in paginated_get(cfg, session, endpoint="branches", params=None):
+            branches.append({
+                "id": branch.get("id"),
+                "name": branch.get("name"),
+                "reference": branch.get("reference"),
+            })
+        print(f"✅ Fetched {len(branches)} branches from Foodics")
+        return branches
+    except Exception as e:
+        print(f"❌ Error fetching branches: {e}")
+        raise
 
 
-# -----------------------------
-# Pagination fetch
-# -----------------------------
+# ---------------------------
+# Payment Method Sync Functions
+# ---------------------------
 
-INCLUDE_QUERY = (
-    "products,products.product,products.product.category,"
-    "branch,device,creator,closer"
-)
-
-def _initial_orders_url(base_url, per_page):
-    endpoint = urljoin(base_url, "orders")
-    query = {
-        "include": INCLUDE_QUERY,
-        "sort": "id",
-        "per_page": per_page,
-        "page": 1,
-    }
-    return f"{endpoint}?{urlencode(query)}"
-
-
-def _fetch_page(session: requests.Session, url: str, attempt=1):
-    resp = session.get(url, timeout=60)
-    if resp.status_code == 429:
-        # small backoff, then let caller decide to retry by calling again
-        wait = min(2 ** attempt, 30)
-        print(f"   • 429 rate limited. Sleeping {wait}s then retrying…")
-        time.sleep(wait)
-        raise requests.HTTPError("429", response=resp)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# -----------------------------
-# Upsert one order
-# -----------------------------
-
-def _upsert_order(order_obj, child_fieldname="items"):
-    order_id = order_obj.get("id")
-    if not order_id:
-        print("   • Skipping an order without id.")
-        return
-
-    # find existing by foodics_order_id
-    existing_name = frappe.db.get_value(
-        "Foodics Order",
-        {"foodics_order_id": order_id},
-        "name",
+def _get_mode_of_payment_by_foodics_id(fid: str):
+    """Get ERPNext Mode of Payment by Foodics payment method ID."""
+    if not frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
+        return None
+    return frappe.db.get_value(
+        "Mode of Payment",
+        filters={"foodics_payment_method_id": fid},
+        fieldname="name",
     )
 
-    if existing_name:
-        doc = frappe.get_doc("Foodics Order", existing_name)
-        _map_parent_fields(doc, order_obj, raw_field="foodics_order_raw")
-        _map_child_items(doc, order_obj.get("products") or [], child_fieldname=child_fieldname)
-        doc.save(ignore_permissions=True)
-        print(f"   • Updated order {order_id} → {doc.name}")
+
+def _get_mode_of_payment_by_name(name: str):
+    """Get ERPNext Mode of Payment by name."""
+    return frappe.db.get_value("Mode of Payment", {"mode_of_payment": name}, "name")
+
+
+def _upsert_mode_of_payment(cfg: FoodicsConfig, payment_method: dict, update_if_exists: bool = False):
+    """
+    Upsert ERPNext Mode of Payment from Foodics payment method.
+    Returns Mode of Payment name.
+    """
+    fid = payment_method.get("id")
+    if not fid:
+        return None
+    
+    # Extract payment method data - handle both JSON:API format and flat structure
+    pm_attrs = payment_method.get("attributes") or {}
+    # If no attributes, use payment_method directly
+    if not pm_attrs:
+        pm_attrs = payment_method
+    
+    name = pm_attrs.get("name") or payment_method.get("name") or f"Payment Method {fid}"
+    pm_type = pm_attrs.get("type") or payment_method.get("type") or "General"
+    code = pm_attrs.get("code") or payment_method.get("code") or ""
+    
+    # Convert type to string if it's an integer
+    if isinstance(pm_type, int):
+        # Foodics payment type codes (common values)
+        type_map_int = {
+            1: "cash",
+            2: "card",
+            3: "bank",
+            4: "credit",
+        }
+        pm_type = type_map_int.get(pm_type, "general")
     else:
-        doc = frappe.new_doc("Foodics Order")
-        _map_parent_fields(doc, order_obj, raw_field="foodics_order_raw")
-        _map_child_items(doc, order_obj.get("products") or [], child_fieldname=child_fieldname)
-        doc.insert(ignore_permissions=True)
-        print(f"   • Inserted order {order_id} → {doc.name}")
+        pm_type = str(pm_type) if pm_type else "general"
+    
+    # Map Foodics payment type to ERPNext type
+    type_mapping = {
+        "cash": "Cash",
+        "card": "Bank",
+        "bank": "Bank",
+        "credit": "Bank",
+        "general": "General",
+    }
+    erpnext_type = type_mapping.get(pm_type.lower() if isinstance(pm_type, str) else "general", "General")
+    
+    # Check if exists by Foodics ID
+    existing_by_foodics = _get_mode_of_payment_by_foodics_id(fid) if fid else None
+    
+    # Check if exists by name
+    existing_by_name = _get_mode_of_payment_by_name(name)
+    
+    existing = existing_by_foodics or existing_by_name
+    
+    if existing:
+        if not update_if_exists:
+            frappe.logger().info(f"⊘ Skipped Mode of Payment (exists, update disabled): {existing} (Foodics {fid})")
+            return existing
+        
+        mop_doc = frappe.get_doc("Mode of Payment", existing)
+        mop_doc.mode_of_payment = name
+        mop_doc.type = erpnext_type
+        mop_doc.enabled = 1
+        
+        # Add custom fields if they exist
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
+            mop_doc.foodics_payment_method_id = fid
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_data"):
+            mop_doc.foodics_payment_method_data = json.dumps(payment_method, ensure_ascii=False)
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_code"):
+            mop_doc.foodics_payment_method_code = code
+        
+        mop_doc.save(ignore_permissions=True)
+        frappe.logger().info(f"↻ Updated Mode of Payment: {mop_doc.name} (Foodics {fid})")
+        return mop_doc.name
+    else:
+        # Create new Mode of Payment
+        mop_doc = frappe.get_doc({
+            "doctype": "Mode of Payment",
+            "mode_of_payment": name,
+            "type": erpnext_type,
+            "enabled": 1,
+        })
+        
+        # Add custom fields if they exist
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
+            mop_doc.foodics_payment_method_id = fid
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_data"):
+            mop_doc.foodics_payment_method_data = json.dumps(payment_method, ensure_ascii=False)
+        if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_code"):
+            mop_doc.foodics_payment_method_code = code
+        
+        mop_doc.insert(ignore_permissions=True)
+        frappe.logger().info(f"＋ Created Mode of Payment: {mop_doc.name} (Foodics {fid})")
+        return mop_doc.name
 
-
-# -----------------------------
-# PUBLIC: sync all orders
-# -----------------------------
 
 @frappe.whitelist()
-def sync_foodics_orders(commit_every: int | None = None):
-    """
-    bench --site <yoursite> execute foodics_migration.api.sync_foodics_orders
-    bench --site <yoursite> execute foodics_migration.api.sync_foodics_orders --kwargs "{'commit_every': 5}"
-    """
-    cfg = _get_foodics_settings()
-    session = _build_session(cfg.token)
-
-    # Schema guards
-    _ensure_order_parent_schema(parent_dt="Foodics Order")
-    _ensure_order_items_schema(parent_dt="Foodics Order", child_dt="Foodics Order Item", child_fieldname="items")
-
-    commit_every = int(commit_every or 20)
-    page_url = _initial_orders_url(cfg.base_url, cfg.per_page)
-
-    total_inserted = 0
-    total_updated = 0
-    total_processed = 0
-    batch_count = 0
-
-    print("=== Foodics Orders Sync ===")
-    print(f"Base URL  : {cfg.base_url}")
-    print(f"Per Page  : {cfg.per_page}")
-    print(f"Commit N  : {commit_every}")
-    print(f"Includes  : {INCLUDE_QUERY}")
-    print("---------------------------")
-
-    while page_url:
-        print(f"\n→ GET {page_url}")
-        attempt = 1
-        while True:
-            try:
-                data = _fetch_page(session, page_url, attempt=attempt)
-                break
-            except requests.HTTPError as e:
-                if str(e) == "429" and attempt <= 5:
-                    attempt += 1
-                    continue
-                # other HTTP errors or too many retries
-                msg = f"HTTP error while fetching: {page_url} -> {getattr(e.response, 'text', e)}"
-                print(msg)
-                frappe.throw(f"Fetch failed: {msg}")
-
-        orders = data.get("data") or []
-        links = data.get("links") or {}
-
-        print(f"• Received {len(orders)} orders")
-
-        for order in orders:
-            before_exists = frappe.db.exists("Foodics Order", {"foodics_order_id": order.get("id")})
-            _upsert_order(order, child_fieldname="items")
-
-            total_processed += 1
-            batch_count += 1
-            if before_exists:
-                total_updated += 1
-            else:
-                total_inserted += 1
-
-            # per-order commit, if you want literally each order:
-            # frappe.db.commit()
-
-            # commit every N
-            if batch_count >= commit_every:
-                frappe.db.commit()
-                print(f"✓ Committed batch of {batch_count}. Totals → processed:{total_processed} inserted:{total_inserted} updated:{total_updated}")
-                batch_count = 0
-
-        # next page via links.next
-        page_url = links.get("next")
-
-    # final commit if some remain
-    if batch_count > 0:
-        frappe.db.commit()
-        print(f"✓ Final commit of {batch_count} pending orders.")
-
-    print("\n=== Done ===")
-    print(f"Processed: {total_processed} | Inserted: {total_inserted} | Updated: {total_updated}")
-
-DEFAULT_PER_PAGE = 100
-
-def _cfg():
-	doc = frappe.get_single("Foodics Settings")
-	if not doc.foodics_base_url:
-		frappe.throw("Foodics Settings: `foodics_base_url` is required.")
-	if not doc.foodics_token:
-		frappe.throw("Foodics Settings: `foodics_token` is required.")
-	return frappe._dict(
-		base_url=doc.foodics_base_url.strip(),
-		token=doc.foodics_token.strip(),
-		per_page=int(doc.foodics_per_page or DEFAULT_PER_PAGE),
-		foodics_price_list=getattr(doc, "foodics_price_list", None),
-		foodics_currency=getattr(doc, "foodics_currency", None),
-		vat_rate=getattr(doc, "vat_rate", 0.15),
-	)
- 
- # ---------- COMBOS (pull + normalize + upsert as Item; price saved AS-IS) ----------
-
-COMBOS_INCLUDE = (
-	"category,tags,timed_events,branches,sizes,items.options.products,"
-	"items.options.products.category,items.options.branches,items.options.price_tags,groups"
-)
-
-def _resolve_pricing_defaults(cfg):
-	price_list = None
-	currency = None
-	try:
-		price_list = getattr(cfg, "foodics_price_list", None) or frappe.db.get_single_value("Selling Settings", "selling_price_list")
-	except Exception:
-		pass
-	try:
-		currency = getattr(cfg, "foodics_currency", None) or (frappe.db.get_default("currency") or "SAR")
-	except Exception:
-		currency = "SAR"
-	if not price_list:
-		price_list = "Standard Selling"
-	return frappe._dict(price_list=price_list, currency=currency)
-
-def _iter_foodics_combos(cfg, s):
+def sync_all_foodics_master_data(sync_log_name=None, enqueue: bool = True):
 	"""
-	Iterator over Foodics combos with a robust include list; we rebuild page URLs so
-	'include=' is present on every page (some backends drop params on links.next).
+	Sync all master data from Foodics: Item Groups, Products, Combos, Customers, Users, Payment Methods.
+	Logs all operations to Foodics Sync Log if provided.
+	
+	Args:
+		sync_log_name: Optional name of Foodics Sync Log record to log to
+		enqueue: If True, enqueue as background job (default: True)
+		
+	Returns:
+		dict with aggregated results from all sync operations, or job info if enqueued
 	"""
-	base = _safe_base_url(cfg.base_url)
-	page = 1
-	per_page = cfg.per_page
-
-	def page_url(p):
-		return f"{base}/combos?include={COMBOS_INCLUDE}&per_page={per_page}&page={p}"
-
-	def index_included(included):
-		idx = {}
-		for inc in included or []:
-			itype = (inc.get("type") or "").strip()
-			iid = inc.get("id")
-			attrs = inc.get("attributes") or {}
-			if not itype or not iid:
-				continue
-			obj = {"id": iid, "type": itype, "attributes": attrs}
-			if "name" in attrs:
-				obj["name"] = attrs.get("name")
-			idx.setdefault(itype, {})[iid] = obj
-		return idx
-
-	def normalize_combo(c, idx):
-		attrs = c.get("attributes") or {}
-		out = dict(attrs)
-		out["id"] = c.get("id") or attrs.get("id") or attrs.get("uuid")
-
-		# category
-		cat_rel = ((c.get("relationships") or {}).get("category") or {}).get("data") or {}
-		cat_id = cat_rel.get("id")
-		if cat_id and "categories" in idx and cat_id in idx["categories"]:
-			out["category"] = {"id": cat_id, "name": idx["categories"][cat_id].get("name")}
-
-		# groups (IDs only)
-		grp_rel = ((c.get("relationships") or {}).get("groups") or {}).get("data") or []
-		out["groups"] = [{"id": g.get("id")} for g in grp_rel if isinstance(g, dict)]
-
-		# sizes
-		sz_rel = ((c.get("relationships") or {}).get("sizes") or {}).get("data") or []
-		out["sizes"] = []
-		for r in sz_rel:
-			sid = r.get("id")
-			if sid and "sizes" in idx and sid in idx["sizes"]:
-				out["sizes"].append(idx["sizes"][sid])
-
-		# branches
-		br_rel = ((c.get("relationships") or {}).get("branches") or {}).get("data") or []
-		out["branches"] = []
-		for r in br_rel:
-			bid = r.get("id")
-			if bid and "branches" in idx and bid in idx["branches"]:
-				out["branches"].append(idx["branches"][bid])
-
-		# timed events
-		te_rel = ((c.get("relationships") or {}).get("timed_events") or {}).get("data") or []
-		out["timed_events"] = []
-		for r in te_rel:
-			tid = r.get("id")
-			if tid and "timed_events" in idx and tid in idx["timed_events"]:
-				out["timed_events"].append(idx["timed_events"][tid])
-
-		# tags
-		tg_rel = ((c.get("relationships") or {}).get("tags") or {}).get("data") or []
-		out["tags"] = []
-		for r in tg_rel:
-			tid = r.get("id")
-			if tid and "tags" in idx and tid in idx["tags"]:
-				out["tags"].append(idx["tags"][tid])
-
-		# items/options/products: preserve embedded payload if present
-		out["items"] = attrs.get("items") or []
-
-		# top-level combo price (saved AS-IS later)
-		out["price"] = attrs.get("price")
-
-		return out
-
-	print(f"[info] Fetching Foodics combos per_page={per_page}")
-	while True:
-		print(f"[info] === Combos Page {page} ===")
-		data = _get_with_backoff(s, page_url(page))
-		included = data.get("included") or []
-		idx = index_included(included)
-		rows = data.get("data") or []
-		print(f"[debug] fetched {len(rows)} combos")
-
-		if not rows:
-			break
-
-		for c in rows:
-			nc = normalize_combo(c, idx)
-			cname = (nc.get("category") or {}).get("name")
-			print(f"[combo] {nc.get('id')} -> category={cname} price={nc.get('price')}")
-			yield nc
-
-		has_next = bool((data.get("links") or {}).get("next"))
-		if not has_next:
-			break
-		page += 1
-
-def _replace_item_price_as_is(cfg, item_code, price):
-	"""
-	Hard-replace the Item Price with the given value (AS-IS; WITHOUT tax math).
-	Uses Foodics Settings price list / currency if present, else sensible fallbacks.
-	"""
-	if price is None:
-		return
-	defs = _resolve_pricing_defaults(cfg)
-
-	# delete existing Item Price rows for this price_list
-	names = frappe.get_all(
-		"Item Price",
-		filters={"item_code": item_code, "price_list": defs.price_list},
-		pluck="name",
-	)
-	for n in names:
-		frappe.delete_doc("Item Price", n, ignore_permissions=True, force=1)
-
-	# create fresh Item Price
-	doc = frappe.get_doc({
-		"doctype": "Item Price",
-		"item_code": item_code,
-		"price_list": defs.price_list,
-		"currency": defs.currency,
-		"price_list_rate": float(price),
-	})
-	doc.insert(ignore_permissions=True)
-	print(f"    · replaced Item Price {defs.price_list} = {price} {defs.currency}")
-
-def _upsert_combo_as_item(cfg, combo):
-	"""
-	Create/Update ERPNext Item from a Foodics Combo.
-	- Match on custom field 'foodics_combo_id' if present; else on item_code == combo.id.
-	- Set Item Group from combo.category.name (auto-create when missing).
-	- Set Item Name from combo.name (if provided).
-	- Replace Item Price AS-IS from combo.price (no VAT math).
-	- Store raw combo JSON in 'foodics_combo_data' if that custom field exists.
-	"""
-	cid = combo.get("id")
-	if not cid:
-		return
-
-	# locate existing Item
-	item_name = None
-	if frappe.get_meta("Item").has_field("foodics_combo_id"):
-		item_name = frappe.db.get_value("Item", {"foodics_combo_id": cid}, "name")
-	if not item_name:
-		item_name = frappe.db.get_value("Item", {"item_code": cid}, "name")
-
-	if item_name:
-		item_doc = frappe.get_doc("Item", item_name)
-	else:
-		item_doc = frappe.get_doc({
-			"doctype": "Item",
-			"item_code": cid,
-			"item_name": combo.get("name") or f"Combo {cid}",
-			"item_group": "All Item Groups",  # temp; corrected below
-			"is_stock_item": 0,
-			"include_item_in_manufacturing": 0,
-			"maintain_stock": 0,
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	# If enqueue is True, run in background
+	if enqueue:
+		# Create sync log first so user can track progress
+		if not sync_log_name:
+			sync_log = frappe.get_doc({
+				"doctype": "Foodics Sync Log",
+				"sync_type": "Master Data",
+				"status": "In Progress",
+				"started_at": frappe.utils.now(),
+			})
+			sync_log.insert(ignore_permissions=True)
+			frappe.db.commit()
+			sync_log_name = sync_log.name
+			sync_log.add_log_entry("Job queued, waiting to start...", None, None, "INFO")
+		
+		job = frappe.enqueue(
+			"foodics_migration.api.sync_all_foodics_master_data",
+			sync_log_name=sync_log_name,
+			enqueue=False,  # Don't enqueue recursively
+			queue="long",
+			timeout=3600,  # 1 hour timeout
+			job_name="sync_all_master_data",
+		)
+		return {
+			"job_id": job.id if hasattr(job, 'id') else str(job),
+			"status": "queued",
+			"sync_log_name": sync_log_name,
+			"message": "Master data sync job has been queued. Check Foodics Sync Log for progress.",
+		}
+	
+	# Get or create sync log
+	sync_log = None
+	if sync_log_name:
+		try:
+			sync_log = frappe.get_doc("Foodics Sync Log", sync_log_name)
+		except frappe.DoesNotExistError:
+			sync_log = None
+	
+	if not sync_log:
+		sync_log = frappe.get_doc({
+			"doctype": "Foodics Sync Log",
+			"sync_type": "Master Data",
+			"status": "In Progress",
+			"started_at": frappe.utils.now(),
 		})
-		item_doc.insert(ignore_permissions=True)
-		print(f"[create] Item for Combo {cid} -> {item_doc.name}")
+		sync_log.insert(ignore_permissions=True)
+		frappe.db.commit()
+		sync_log_name = sync_log.name
+	
+	total_results = {
+		"item_groups": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+		"products": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+		"combos": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+		"customers": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+		"users": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+		"payment_methods": {"created": 0, "updated": 0, "skipped": 0, "failed": 0},
+	}
+	
+	try:
+		# 1. Sync Item Groups
+		sync_log.add_log_entry("Starting Item Groups sync...", "Item Groups", None, "INFO")
+		try:
+			result = sync_foodics_item_groups()
+			if result:
+				total_results["item_groups"] = result
+				sync_log.add_log_entry(
+					f"Item Groups sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Item Groups", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Item Groups sync failed: {str(e)}", "Item Groups", None, "FAILED")
+			frappe.log_error(title="Item Groups Sync Error", message=frappe.get_traceback())
+		
+		# 2. Sync Products
+		sync_log.add_log_entry("Starting Products sync...", "Products", None, "INFO")
+		try:
+			result = sync_foodics_products()
+			if result:
+				total_results["products"] = result
+				sync_log.add_log_entry(
+					f"Products sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Products", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Products sync failed: {str(e)}", "Products", None, "FAILED")
+			frappe.log_error(title="Products Sync Error", message=frappe.get_traceback())
+		
+		# 3. Sync Combos
+		sync_log.add_log_entry("Starting Combos sync...", "Combos", None, "INFO")
+		try:
+			from foodics_migration.api_combo import sync_foodics_combos
+			result = sync_foodics_combos()
+			if result:
+				total_results["combos"] = result
+				sync_log.add_log_entry(
+					f"Combos sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Combos", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Combos sync failed: {str(e)}", "Combos", None, "FAILED")
+			frappe.log_error(title="Combos Sync Error", message=frappe.get_traceback())
+		
+		# 4. Sync Customers
+		sync_log.add_log_entry("Starting Customers sync...", "Customers", None, "INFO")
+		try:
+			result = sync_foodics_customers()
+			if result:
+				total_results["customers"] = result
+				sync_log.add_log_entry(
+					f"Customers sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Customers", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Customers sync failed: {str(e)}", "Customers", None, "FAILED")
+			frappe.log_error(title="Customers Sync Error", message=frappe.get_traceback())
+		
+		# 5. Sync Users
+		sync_log.add_log_entry("Starting Users sync...", "Users", None, "INFO")
+		try:
+			result = sync_foodics_users()
+			if result:
+				total_results["users"] = result
+				sync_log.add_log_entry(
+					f"Users sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Users", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Users sync failed: {str(e)}", "Users", None, "FAILED")
+			frappe.log_error(title="Users Sync Error", message=frappe.get_traceback())
+		
+		# 6. Sync Payment Methods
+		sync_log.add_log_entry("Starting Payment Methods sync...", "Payment Methods", None, "INFO")
+		try:
+			result = sync_foodics_payment_methods()
+			if result:
+				total_results["payment_methods"] = result
+				sync_log.add_log_entry(
+					f"Payment Methods sync completed: Created={result.get('created', 0)}, Updated={result.get('updated', 0)}, Skipped={result.get('skipped', 0)}, Failed={result.get('failed', 0)}",
+					"Payment Methods", None, "INFO"
+				)
+		except Exception as e:
+			sync_log.add_log_entry(f"Payment Methods sync failed: {str(e)}", "Payment Methods", None, "FAILED")
+			frappe.log_error(title="Payment Methods Sync Error", message=frappe.get_traceback())
+		
+		# Calculate totals
+		total_created = sum(r.get("created", 0) for r in total_results.values())
+		total_updated = sum(r.get("updated", 0) for r in total_results.values())
+		total_skipped = sum(r.get("skipped", 0) for r in total_results.values())
+		total_failed = sum(r.get("failed", 0) for r in total_results.values())
+		total_records = total_created + total_updated + total_skipped + total_failed
+		
+		# Update sync log
+		sync_log.total_records = total_records
+		sync_log.created = total_created
+		sync_log.updated = total_updated
+		sync_log.skipped = total_skipped
+		sync_log.failed = total_failed
+		
+		status = "Completed" if total_failed == 0 else "Partial"
+		sync_log.finalize_log(status)
+		
+		return {
+			"sync_log_name": sync_log.name,
+			"total": {
+				"created": total_created,
+				"updated": total_updated,
+				"skipped": total_skipped,
+				"failed": total_failed,
+				"total_records": total_records,
+			},
+			"details": total_results,
+		}
+		
+	except Exception as e:
+		if sync_log:
+			sync_log.add_log_entry(f"Master data sync aborted: {str(e)}", None, None, "FAILED")
+			sync_log.finalize_log("Failed")
+		frappe.log_error(title="Master Data Sync Error", message=frappe.get_traceback())
+		raise
 
-	# refresh name
-	if combo.get("name") and item_doc.item_name != combo.get("name"):
-		item_doc.item_name = combo.get("name")
-
-	# set Item Group from combo.category
-	cat_name = (combo.get("category") or {}).get("name")
-	ig = _ensure_item_group(cat_name or "Unassigned (Foodics)", parent="All Item Groups")
-	if item_doc.item_group != ig:
-		item_doc.item_group = ig
-		print(f"    · set item_group = {ig}")
-
-	# persist Foodics combo id if custom field exists
-	if frappe.get_meta("Item").has_field("foodics_combo_id") and not item_doc.get("foodics_combo_id"):
-		item_doc.set("foodics_combo_id", cid)
-
-	# raw payload for traceability
-	if frappe.get_meta("Item").has_field("foodics_combo_data"):
-		item_doc.set("foodics_combo_data", json.dumps(combo, ensure_ascii=False))
-
-	item_doc.save(ignore_permissions=True)
-
-	# Replace Item Price with combo.price AS-IS (WITHOUT tax)
-	_replace_item_price_as_is(cfg, item_doc.name, combo.get("price"))
 
 @frappe.whitelist()
-def sync_foodics_combos():
-	"""
-	Fetch Foodics combos (with deep includes) and upsert each as an ERPNext Item:
-	- Item Group from combo category
-	- Price set exactly as provided (no VAT math)
-	- Raw combo JSON stored when corresponding custom field exists
-	"""
-	cfg = _cfg()
-	s = _new_session(cfg.token)
+def sync_foodics_payment_methods():
+    """
+    Sync Foodics Payment Methods to ERPNext Mode of Payment.
+    Maps Foodics payment methods to ERPNext Mode of Payment doctype.
+    
+    Run via:
+      bench --site <yoursite> execute foodics_migration.api.sync_foodics_payment_methods
+    """
+    frappe.only_for(("System Manager", "Administrator"))
+    
+    cfg = load_foodics_settings()
+    logger = frappe.logger()
+    logger.setLevel(cfg.log_level)
+    
+    # Get update setting from Foodics Settings
+    settings = frappe.get_single("Foodics Settings")
+    update_if_exists = bool(getattr(settings, "update_payment_methods_if_exists", 0))
+    
+    session = make_foodics_session(cfg)
+    
+    count = 0
+    skipped = 0
+    created = 0
+    updated = 0
+    failed = 0
+    
+    try:
+        for payment_method in paginated_get(cfg, session, endpoint="payment_methods", params=None):
+            try:
+                fid = payment_method.get("id")
+                existing = _get_mode_of_payment_by_foodics_id(fid) if fid else None
+                was_existing = existing is not None
+                
+                result = _upsert_mode_of_payment(cfg, payment_method, update_if_exists=update_if_exists)
+                
+                if not result:
+                    failed += 1
+                    continue
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                else:
+                    created += 1
+                    count += 1
+                
+                # Commit batching
+                if (count + skipped + failed) % cfg.commit_every_n_records == 0:
+                    frappe.db.commit()
+                    logger.info(f"Processed {count + skipped + failed} payment methods so far...")
+                    
+            except Exception as e:
+                failed += 1
+                frappe.log_error(
+                    title="Foodics Payment Method Sync Error",
+                    message=f"Failed to sync payment method {payment_method.get('id', 'unknown')}: {e}\n{frappe.get_traceback()}",
+                )
+                logger.error(f"❌ Failed to sync payment method {payment_method.get('id', 'unknown')}: {e}")
+                # Continue with next payment method
+                
+        # Final commit
+        frappe.db.commit()
+        logger.info(f"✅ Finished Foodics payment methods sync. Created: {created}, Updated: {updated}, Skipped: {skipped}, Failed: {failed}")
+        
+        return {
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+        }
+        
+    except Exception as e:
+        frappe.db.rollback()
+        frappe.log_error(title="Foodics Payment Method Sync Error", message=frappe.get_traceback())
+        raise
 
-	processed = 0
-	upserted = 0
 
-	try:
-		for combo in _iter_foodics_combos(cfg, s):
-			_upsert_combo_as_item(cfg, combo)
-			processed += 1
-			upserted += 1
+# ---------------------------
+# User Sync Functions
+# ---------------------------
 
-		frappe.db.commit()
-		print(f"[info] Done. combos_processed={processed}, upserted={upserted}")
+def _get_user_by_foodics_id(fid: str):
+    """Get ERPNext User by Foodics user ID."""
+    if not frappe.get_meta("User").has_field("foodics_user_id"):
+        return None
+    return frappe.db.get_value(
+        "User",
+        filters={"foodics_user_id": fid},
+        fieldname="name",
+    )
 
-	except Exception as e:
-		frappe.db.rollback()
-		print(f"[error] Combo sync aborted: {e}")
-		raise
+
+def _get_user_by_email(email: str):
+    """Get ERPNext User by email."""
+    if not email:
+        return None
+    return frappe.db.get_value("User", {"email": email}, "name")
+
+
+def _extract_user_name(user_data: dict) -> tuple:
+    """Extract first_name, middle_name, last_name from Foodics user name."""
+    name = user_data.get("name") or ""
+    if not name:
+        return ("", "", "")
+    
+    parts = name.strip().split()
+    if len(parts) >= 3:
+        return (parts[0], parts[1], " ".join(parts[2:]))
+    elif len(parts) == 2:
+        return (parts[0], "", parts[1])
+    else:
+        return (parts[0] if parts else "", "", "")
+
+
+def _upsert_user(cfg: FoodicsConfig, user_data: dict, update_if_exists: bool = False) -> str:
+    """
+    Upsert ERPNext User from Foodics user data.
+    Returns User name (email).
+    """
+    from frappe.utils import now_datetime
+    
+    fid = user_data.get("id")
+    if not fid:
+        return ""
+    
+    # Extract user data - handle JSON:API format
+    user_attrs = user_data.get("attributes") or user_data
+    email = user_attrs.get("email") or user_data.get("email") or ""
+    phone = user_attrs.get("phone") or user_data.get("phone") or ""
+    name = user_attrs.get("name") or user_data.get("name") or ""
+    number = user_attrs.get("number") or user_data.get("number") or ""
+    
+    # If no email, skip this user (email is required for ERPNext User)
+    if not email:
+        frappe.logger().warning(f"⚠️ Skipping Foodics user {fid}: No email address")
+        return ""
+    
+    first_name, middle_name, last_name = _extract_user_name(user_attrs if user_attrs != user_data else user_data)
+    
+    # Check if user exists by Foodics ID or email
+    existing_by_foodics = _get_user_by_foodics_id(fid) if fid else None
+    existing_by_email = _get_user_by_email(email)
+    
+    existing = existing_by_foodics or existing_by_email
+    
+    now = now_datetime()
+    
+    user_fields = {
+        "email": email,
+        "first_name": first_name or email.split("@")[0],
+        "middle_name": middle_name or "",
+        "last_name": last_name or "",
+        "phone": phone or "",
+        "enabled": 1,
+        "send_welcome_email": 0,
+    }
+    
+    # Add custom fields if they exist
+    if frappe.get_meta("User").has_field("foodics_user_id"):
+        user_fields["foodics_user_id"] = fid
+    if frappe.get_meta("User").has_field("foodics_user_data"):
+        user_fields["foodics_user_data"] = json.dumps(user_data, ensure_ascii=False)
+    
+    if existing:
+        if not update_if_exists:
+            frappe.logger().info(f"⊘ Skipped User (exists, update disabled): {existing} (Foodics {fid})")
+            return existing
+        
+        user_doc = frappe.get_doc("User", existing)
+        user_doc.update(user_fields)
+        user_doc.save(ignore_permissions=True)
+        frappe.logger().info(f"↻ Updated User: {user_doc.name} (Foodics {fid})")
+        return user_doc.name
+    else:
+        # Create new user
+        user_doc = frappe.get_doc({
+            "doctype": "User",
+            **user_fields
+        })
+        user_doc.insert(ignore_permissions=True)
+        
+        # Add Employee role if it exists
+        if frappe.db.exists("Role", "Employee"):
+            user_doc.add_roles("Employee")
+        
+        frappe.logger().info(f"＋ Created User: {user_doc.name} (Foodics {fid})")
+        return user_doc.name
+
+
+@frappe.whitelist()
+def sync_foodics_users():
+    """
+    Sync Foodics Users to ERPNext Users.
+    Maps Foodics users to ERPNext User doctype.
+    
+    Run via:
+      bench --site <yoursite> execute foodics_migration.api.sync_foodics_users
+    """
+    frappe.only_for(("System Manager", "Administrator"))
+    
+    cfg = load_foodics_settings()
+    logger = frappe.logger()
+    logger.setLevel(cfg.log_level)
+    
+    # Get update setting from Foodics Settings
+    settings = frappe.get_single("Foodics Settings")
+    update_if_exists = bool(getattr(settings, "update_users_if_exists", 0))
+    
+    session = make_foodics_session(cfg)
+    
+    count = 0
+    skipped = 0
+    created = 0
+    updated = 0
+    failed = 0
+    
+    try:
+        for user in paginated_get(cfg, session, endpoint="users", params=None):
+            try:
+                fid = user.get("id")
+                existing = _get_user_by_foodics_id(fid) if fid else None
+                was_existing = existing is not None
+                
+                result = _upsert_user(cfg, user, update_if_exists=update_if_exists)
+                
+                if not result:
+                    failed += 1
+                    continue
+                
+                if was_existing and not update_if_exists:
+                    skipped += 1
+                elif was_existing:
+                    updated += 1
+                    count += 1
+                else:
+                    created += 1
+                    count += 1
+                
+                # Commit batching
+                if (count + skipped + failed) % cfg.commit_every_n_records == 0:
+                    frappe.db.commit()
+                    logger.info(f"Processed {count + skipped + failed} users so far...")
+                    
+            except Exception as e:
+                failed += 1
+                frappe.log_error(
+                    title="Foodics User Sync Error",
+                    message=f"Failed to sync user {user.get('id', 'unknown')}: {e}\n{frappe.get_traceback()}",
+                )
+                logger.error(f"❌ Failed to sync user {user.get('id', 'unknown')}: {e}")
+                # Continue with next user
+                
+        # Final commit
+        frappe.db.commit()
+        logger.info(f"✅ Finished Foodics users sync. Created: {created}, Updated: {updated}, Skipped: {skipped}, Failed: {failed}")
+        
+        return {
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+        }
+        
+    except Exception as e:
+        frappe.db.rollback()
+        frappe.log_error(title="Foodics User Sync Error", message=frappe.get_traceback())
+        raise
