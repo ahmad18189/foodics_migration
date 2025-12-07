@@ -1,0 +1,124 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-09-15 15:17:48.534114",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "foodics_order_item_id",
+  "status",
+  "quantity",
+  "unit_price_gross",
+  "total_price_gross",
+  "unit_price_net",
+  "total_price_net",
+  "discount_amount",
+  "foodics_product_id",
+  "foodics_product_name",
+  "foodics_category_id",
+  "foodics_category_name",
+  "erp_item_code",
+  "foodics_item_uuid",
+  "kitchen_notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "foodics_order_item_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Foodics Order Item ID"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Status"
+  },
+  {
+   "fieldname": "quantity",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Quantity"
+  },
+  {
+   "fieldname": "unit_price_gross",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Unit Price Gross"
+  },
+  {
+   "fieldname": "total_price_gross",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Total Price Gross"
+  },
+  {
+   "fieldname": "unit_price_net",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Unit Price Net"
+  },
+  {
+   "fieldname": "total_price_net",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Total Price Net"
+  },
+  {
+   "fieldname": "discount_amount",
+   "fieldtype": "Currency",
+   "label": "Discount Amount"
+  },
+  {
+   "fieldname": "foodics_product_id",
+   "fieldtype": "Data",
+   "label": "Foodics Product ID"
+  },
+  {
+   "fieldname": "foodics_product_name",
+   "fieldtype": "Data",
+   "label": "Foodics Product Name"
+  },
+  {
+   "fieldname": "foodics_category_id",
+   "fieldtype": "Data",
+   "label": "Foodics Category ID"
+  },
+  {
+   "fieldname": "foodics_category_name",
+   "fieldtype": "Data",
+   "label": "Foodics Category Name"
+  },
+  {
+   "fieldname": "erp_item_code",
+   "fieldtype": "Link",
+   "label": "ERPNext Item Code",
+   "options": "Item"
+  },
+  {
+   "fieldname": "foodics_item_uuid",
+   "fieldtype": "Data",
+   "label": "Foodics Item UUID"
+  },
+  {
+   "fieldname": "kitchen_notes",
+   "fieldtype": "Small Text",
+   "label": "Kitchen Notes"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2025-09-15 17:43:04.138668",
+ "modified_by": "Administrator",
+ "module": "Foodics Migration",
+ "name": "Foodics Order Item",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

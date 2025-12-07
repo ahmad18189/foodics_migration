@@ -1,0 +1,68 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-09-15 18:22:43.006250",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "charge_id",
+  "charge_code",
+  "charge_name",
+  "amount_gross",
+  "amount_net",
+  "taxes_json",
+  "charge_raw"
+ ],
+ "fields": [
+  {
+   "fieldname": "charge_id",
+   "fieldtype": "Data",
+   "label": "Charge ID"
+  },
+  {
+   "fieldname": "charge_code",
+   "fieldtype": "Data",
+   "label": "Charge Code"
+  },
+  {
+   "fieldname": "charge_name",
+   "fieldtype": "Data",
+   "label": "Charge Name"
+  },
+  {
+   "fieldname": "amount_gross",
+   "fieldtype": "Currency",
+   "label": "Amount (Gross)"
+  },
+  {
+   "fieldname": "amount_net",
+   "fieldtype": "Currency",
+   "label": "Amount (Net)"
+  },
+  {
+   "fieldname": "taxes_json",
+   "fieldtype": "Long Text",
+   "label": "Taxes JSON"
+  },
+  {
+   "fieldname": "charge_raw",
+   "fieldtype": "Long Text",
+   "label": "Charge Raw"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2025-09-15 18:27:39.284657",
+ "modified_by": "Administrator",
+ "module": "Foodics Migration",
+ "name": "Foodics Order Charge",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -1,0 +1,194 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-09-14 12:56:14.954225",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "foodics_base_url",
+  "foodics_token",
+  "column_break_ijki",
+  "foodics_per_page",
+  "foodics_currency",
+  "foodics_price_list",
+  "vat_rate",
+  "section_break_pljb",
+  "request_timeout_seconds",
+  "max_retries",
+  "retry_backoff_max_seconds",
+  "default_uom",
+  "column_break_avoc",
+  "default_warehouse",
+  "commit_every_n_records",
+  "respect_foodics_deleted",
+  "log_level",
+  "section_break_gram",
+  "default_customer_group",
+  "default_territory",
+  "customer_naming_series",
+  "address_country_default",
+  "address_city_default",
+  "respect_foodics_deleted_customers"
+ ],
+ "fields": [
+  {
+   "fieldname": "foodics_base_url",
+   "fieldtype": "Data",
+   "label": "foodics_base_url"
+  },
+  {
+   "fieldname": "foodics_token",
+   "fieldtype": "Long Text",
+   "label": "foodics_token"
+  },
+  {
+   "default": "SAR",
+   "fieldname": "column_break_ijki",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "foodics_per_page",
+   "fieldtype": "Int",
+   "label": "foodics_per_page"
+  },
+  {
+   "default": "SAR",
+   "fieldname": "foodics_currency",
+   "fieldtype": "Link",
+   "label": "foodics_currency",
+   "options": "Currency"
+  },
+  {
+   "default": "Standard Selling",
+   "fieldname": "foodics_price_list",
+   "fieldtype": "Link",
+   "label": "foodics_price_list",
+   "options": "Price List"
+  },
+  {
+   "fieldname": "section_break_pljb",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "100",
+   "fieldname": "request_timeout_seconds",
+   "fieldtype": "Int",
+   "label": "request_timeout_seconds"
+  },
+  {
+   "fieldname": "max_retries",
+   "fieldtype": "Int",
+   "label": "max_retries"
+  },
+  {
+   "default": "30",
+   "fieldname": "retry_backoff_max_seconds",
+   "fieldtype": "Int",
+   "label": "retry_backoff_max_seconds"
+  },
+  {
+   "default": "Nos",
+   "fieldname": "default_uom",
+   "fieldtype": "Link",
+   "label": "default_uom",
+   "options": "UOM"
+  },
+  {
+   "fieldname": "column_break_avoc",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "default_warehouse",
+   "fieldtype": "Link",
+   "label": "default_warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "commit_every_n_records",
+   "fieldtype": "Int",
+   "label": "commit_every_n_records"
+  },
+  {
+   "default": "0",
+   "fieldname": "respect_foodics_deleted",
+   "fieldtype": "Check",
+   "label": "respect_foodics_deleted"
+  },
+  {
+   "fieldname": "log_level",
+   "fieldtype": "Select",
+   "label": "log_level",
+   "options": "INFO\nWARN\nDEBUG"
+  },
+  {
+   "fieldname": "vat_rate",
+   "fieldtype": "Float",
+   "label": "vat_rate"
+  },
+  {
+   "fieldname": "section_break_gram",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "default_customer_group",
+   "fieldtype": "Link",
+   "label": "default_customer_group",
+   "options": "Customer Group"
+  },
+  {
+   "default": "Saudi Arabia",
+   "fieldname": "default_territory",
+   "fieldtype": "Link",
+   "label": "default_territory",
+   "options": "Territory"
+  },
+  {
+   "default": "CUST-.YYYY.-.#####",
+   "fieldname": "customer_naming_series",
+   "fieldtype": "Data",
+   "label": "customer_naming_series"
+  },
+  {
+   "fieldname": "address_country_default",
+   "fieldtype": "Link",
+   "label": "address_country_default",
+   "options": "Country"
+  },
+  {
+   "fieldname": "address_city_default",
+   "fieldtype": "Data",
+   "label": "address_city_default"
+  },
+  {
+   "default": "0",
+   "fieldname": "respect_foodics_deleted_customers",
+   "fieldtype": "Check",
+   "label": "respect_foodics_deleted_customers"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-09-15 14:36:25.139309",
+ "modified_by": "Administrator",
+ "module": "Foodics Migration",
+ "name": "Foodics Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

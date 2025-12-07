@@ -1,0 +1,85 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "hash",
+ "creation": "2025-09-15 18:22:42.825283",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "payment_id",
+  "amount",
+  "currency",
+  "payment_method_id",
+  "payment_method_name",
+  "user_id",
+  "user_name",
+  "paid_at",
+  "payment_raw"
+ ],
+ "fields": [
+  {
+   "fieldname": "payment_id",
+   "fieldtype": "Data",
+   "label": "Payment ID"
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount"
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Data",
+   "label": "Currency"
+  },
+  {
+   "fieldname": "payment_method_id",
+   "fieldtype": "Data",
+   "label": "Payment Method ID"
+  },
+  {
+   "fieldname": "payment_method_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Payment Method Name"
+  },
+  {
+   "fieldname": "user_id",
+   "fieldtype": "Data",
+   "label": "User ID"
+  },
+  {
+   "fieldname": "user_name",
+   "fieldtype": "Data",
+   "label": "User Name"
+  },
+  {
+   "fieldname": "paid_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Paid At"
+  },
+  {
+   "fieldname": "payment_raw",
+   "fieldtype": "Long Text",
+   "label": "Payment Raw"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2025-09-15 20:23:31.717934",
+ "modified_by": "Administrator",
+ "module": "Foodics Migration",
+ "name": "Foodics Order Payment",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
