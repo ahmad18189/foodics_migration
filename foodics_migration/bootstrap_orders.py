@@ -278,11 +278,8 @@ def bootstrap_foodics_order_schema():
 
 
 
-def hit();
-    from foodics_migration.bootstrap_orders import (
-        append_products_items, append_combos_and_flatten_items,
-        append_payments, append_charges
-    )
+def hit(order_doc, order_json):
+    """Populate Foodics order children from API JSON (pass Foodics Order doc + API payload dict)."""
 
     # Clear previous children if you are upserting:
     order_doc.set("items", [])

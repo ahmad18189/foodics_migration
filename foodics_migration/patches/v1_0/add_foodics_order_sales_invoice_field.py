@@ -35,3 +35,22 @@ def execute():
 	frappe.db.commit()
 	frappe.msgprint("Sales Invoice field added to Foodics Order successfully.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

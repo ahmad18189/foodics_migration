@@ -140,3 +140,22 @@ def fix_item_group_for_item(item_code: str):
 	else:
 		frappe.throw(f"Failed to resolve Item Group for category {category_id}. Item Group may need to be synced first.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

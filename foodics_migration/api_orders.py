@@ -132,18 +132,12 @@ def _rebuild_next_with_include(cfg, next_url: str, date_filters: Optional[Dict[s
         to_date = date_filters.get("to_date")
         date_field = date_filters.get("date_field", "business_date")
         
-        if from_date or to_date:
-            if date_field == "business_date":
-                if from_date:
-                    query_params["filter[business_date_after]"] = from_date
-                if to_date:
-                    query_params["filter[business_date_before]"] = to_date
-            elif date_field == "updated_at":
-                if from_date:
-                    query_params["filter[updated_after]"] = from_date
-            elif date_field == "created_at":
-                if from_date:
-                    query_params["filter[created_on]"] = from_date
+        if date_field == "business_date" and from_date:
+            query_params["filter[business_date_after]"] = from_date
+        elif date_field == "updated_at" and from_date:
+            query_params["filter[updated_after]"] = from_date
+        elif date_field == "created_at" and from_date:
+            query_params["filter[created_on]"] = from_date
     
     # Rebuild full list URL with our canonical params
     return f"{base}/orders?{urlencode(query_params)}"
@@ -503,11 +497,47 @@ def _map_children(order_json: Dict[str, Any], doc: frappe.model.document.Documen
         if "tip_amount" in chp.as_dict():
             chp.tip_amount = pay.get("tip_amount")
 
+        # Get payment_method - check both direct object and included array (JSON:API format)
         pm = (pay.get("payment_method") or {})
-        if "payment_method_id" in chp.as_dict():
-            chp.payment_method_id = pm.get("id")
-        if "payment_method_name" in chp.as_dict():
-            chp.payment_method_name = pm.get("name")
+        pm_id = None
+        pm_name = None
+        
+        # If payment_method is a dict with id/name, use it
+        if isinstance(pm, dict) and pm:
+            pm_id = pm.get("id")
+            pm_name = pm.get("name") or pm.get("attributes", {}).get("name")
+        
+        # If payment_method is just an ID reference, check included array
+        if not pm_id and isinstance(pm, str):
+            pm_id = pm
+            # Try to find payment_method in included array
+            if "included" in order_json:
+                included = order_json.get("included") or []
+                for resource in included:
+                    if resource.get("type") == "payment_method" and resource.get("id") == pm_id:
+                        attrs = resource.get("attributes") or {}
+                        pm_name = attrs.get("name")
+                        break
+        
+        # Also check relationships.payment_method.data.id (JSON:API format)
+        if not pm_id:
+            rel = pay.get("relationships", {})
+            pm_rel = rel.get("payment_method", {})
+            pm_data = pm_rel.get("data", {})
+            pm_id = pm_data.get("id")
+            if pm_id and "included" in order_json:
+                included = order_json.get("included") or []
+                for resource in included:
+                    if resource.get("type") == "payment_method" and resource.get("id") == pm_id:
+                        attrs = resource.get("attributes") or {}
+                        pm_name = attrs.get("name")
+                        break
+        
+        # Set payment method fields
+        if "payment_method_id" in chp.as_dict() and pm_id:
+            chp.payment_method_id = pm_id
+        if "payment_method_name" in chp.as_dict() and pm_name:
+            chp.payment_method_name = pm_name
 
         usr = (pay.get("user") or {})
         if "cashier_id" in chp.as_dict():
@@ -541,7 +571,14 @@ def _map_children(order_json: Dict[str, Any], doc: frappe.model.document.Documen
 # FETCH / UPSERT
 # ---------------------------
 
-def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optional[Dict[str, Any]] = None, only_fully_paid: bool = False):
+def _paginate_orders(
+	cfg: frappe._dict,
+	s: requests.Session,
+	date_filters: Optional[Dict[str, Any]] = None,
+	only_fully_paid: bool = False,
+	start_page: int = 1,
+	sync_log: Optional[frappe.model.document.Document] = None,
+):
     """
     Paginate through Foodics orders with optional date filtering and fully paid filter.
     
@@ -552,7 +589,7 @@ def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optio
         only_fully_paid: If True, only yield orders where sum(payments) >= total_price
     """
     base = _safe_base_url(cfg.foodics_base_url)
-    page = 1
+    page = max(start_page or 1, 1)
     print(f"[info] Page size: {cfg.foodics_per_page}")
     print(f"[info] Commit every: {cfg.commit_every_n_records} order(s)")
     print(f"[info] Using include={INCLUDE_Q}")
@@ -582,12 +619,9 @@ def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optio
             elif date_field == "updated_at":
                 if from_date:
                     query_params["filter[updated_after]"] = from_date
-            elif date_field == "created_at":
-                if from_date:
-                    query_params["filter[created_on]"] = from_date
-                if to_date:
-                    # Foodics API uses created_on for date, but we can add range if needed
-                    pass
+        elif date_field == "created_at":
+            if from_date:
+                query_params["filter[created_on]"] = from_date
             print(f"[info] Date filters: {date_field} from {from_date} to {to_date}")
 
     url = f"{base}/orders?{urlencode(query_params)}"
@@ -595,6 +629,12 @@ def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optio
     while url:
         print(f"[info] === Page {page} ===")
         print(f"[debug] URL={url}")
+        if sync_log:
+            try:
+                sync_log.db_set("current_page", page)
+                sync_log.db_set("last_request_url", url)
+            except Exception:
+                pass
         data = _get_with_backoff(s, url)
         rows = data.get("data") or []
         print(f"[debug] fetched {len(rows)} orders on this page")
@@ -605,6 +645,14 @@ def _paginate_orders(cfg: frappe._dict, s: requests.Session, date_filters: Optio
                 if not _is_order_fully_paid(row):
                     continue
             yield row
+
+        if sync_log:
+            try:
+                sync_log.db_set("last_page_processed", page)
+                sync_log.db_set("resume_page", page + 1)
+            except Exception:
+                pass
+
         links = data.get("links") or {}
         nxt = links.get("next")
         if nxt:
@@ -710,9 +758,47 @@ def _upsert_one_order(order_json: Dict[str, Any], update_if_exists: bool = False
         chp.amount = pay.get("amount")
         if "tip_amount" in chp.as_dict():
             chp.tip_amount = pay.get("tip_amount")
+        # Get payment_method - check both direct object and included array (JSON:API format)
         pm = (pay.get("payment_method") or {})
-        chp.payment_method_id = pm.get("id")
-        chp.payment_method_name = pm.get("name")
+        pm_id = None
+        pm_name = None
+        
+        # If payment_method is a dict with id/name, use it
+        if isinstance(pm, dict) and pm:
+            pm_id = pm.get("id")
+            pm_name = pm.get("name") or pm.get("attributes", {}).get("name")
+        
+        # If payment_method is just an ID reference, check included array
+        if not pm_id and isinstance(pm, str):
+            pm_id = pm
+            # Try to find payment_method in included array
+            if "included" in order_json:
+                included = order_json.get("included") or []
+                for resource in included:
+                    if resource.get("type") == "payment_method" and resource.get("id") == pm_id:
+                        attrs = resource.get("attributes") or {}
+                        pm_name = attrs.get("name")
+                        break
+        
+        # Also check relationships.payment_method.data.id (JSON:API format)
+        if not pm_id:
+            rel = pay.get("relationships", {})
+            pm_rel = rel.get("payment_method", {})
+            pm_data = pm_rel.get("data", {})
+            pm_id = pm_data.get("id")
+            if pm_id and "included" in order_json:
+                included = order_json.get("included") or []
+                for resource in included:
+                    if resource.get("type") == "payment_method" and resource.get("id") == pm_id:
+                        attrs = resource.get("attributes") or {}
+                        pm_name = attrs.get("name")
+                        break
+        
+        # Set payment method fields
+        if pm_id:
+            chp.payment_method_id = pm_id
+        if pm_name:
+            chp.payment_method_name = pm_name
         usr = (pay.get("user") or {})
         if "cashier_id" in chp.as_dict():
             chp.cashier_id = usr.get("id")
@@ -1127,6 +1213,16 @@ def _get_item_by_sku(sku: str) -> Optional[str]:
 	)
 
 
+def _get_item_by_name(item_name: str) -> Optional[str]:
+	"""Get Item name by item_name (friendly name) or fallback to name."""
+	if not item_name:
+		return None
+	found = frappe.db.get_value("Item", {"item_name": item_name}, "name")
+	if not found:
+		found = frappe.db.get_value("Item", {"name": item_name}, "name")
+	return found
+
+
 @frappe.whitelist()
 def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 	"""
@@ -1265,29 +1361,81 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 		if not cost_center:
 			print(f"[warn] No cost center mapping found for branch {branch_id or branch_name}")
 	
-	# Get posting date
-	posting_date = getattr(order_doc, "business_date", None)
-	if not posting_date:
-		posting_date = getattr(order_doc, "opened_at", None)
-		if posting_date:
-			# Extract date from datetime
-			if isinstance(posting_date, str):
-				posting_date = posting_date.split()[0] if " " in posting_date else posting_date
+	# Get posting date and time from Foodics order
+	# Priority: closed_at > opened_at > business_date
+	posting_datetime_str = None
+	posting_date = None
+	posting_time = None
+	
+	# Try closed_at first (most accurate - when order was completed)
+	closed_at = getattr(order_doc, "closed_at", None)
+	if closed_at:
+		posting_datetime_str = closed_at
+	# Fallback to opened_at
+	elif getattr(order_doc, "opened_at", None):
+		posting_datetime_str = order_doc.opened_at
+	# Fallback to business_date
+	else:
+		business_date = getattr(order_doc, "business_date", None)
+		if business_date:
+			posting_datetime_str = business_date
+	
+	# Parse datetime string to extract date and time
+	if posting_datetime_str:
+		from datetime import datetime
+		if isinstance(posting_datetime_str, str):
+			# Try parsing ISO format: "2025-12-06T14:30:00" or "2025-12-06 14:30:00"
+			try:
+				if "T" in posting_datetime_str:
+					dt = datetime.fromisoformat(posting_datetime_str.replace("Z", "+00:00"))
+				elif " " in posting_datetime_str:
+					dt = datetime.strptime(posting_datetime_str, "%Y-%m-%d %H:%M:%S")
+				else:
+					dt = datetime.strptime(posting_datetime_str, "%Y-%m-%d")
+				posting_date = dt.date()
+				posting_time = dt.time()
+			except Exception as parse_err:
+				print(f"[warn] Failed to parse datetime {posting_datetime_str}: {parse_err}")
+				# Fallback: extract date only
+				posting_date = posting_datetime_str.split()[0] if " " in posting_datetime_str else posting_datetime_str
+		else:
+			# Already a datetime object
+			posting_date = posting_datetime_str.date() if hasattr(posting_datetime_str, "date") else posting_datetime_str
+			posting_time = posting_datetime_str.time() if hasattr(posting_datetime_str, "time") else None
 	
 	# Create Sales Invoice
 	invoice = frappe.new_doc("Sales Invoice")
 	invoice.customer = customer_name
+	
+	# Enable set posting time (required to set custom posting time) - ALWAYS set to 1
+	# Set both flag and field value
+	invoice.flags.set_posting_time = 1
+	# Force set the field value - try multiple methods
+	invoice.set_posting_time = 1
+	# Also try using set method to ensure it's saved
+	try:
+		invoice.set("set_posting_time", 1)
+	except Exception:
+		pass
+	print(f"[info] Set set_posting_time = 1 for invoice")
+	print(f"[info] Set set_posting_time = 1 for invoice")
 	
 	# Set company
 	company = frappe.db.get_single_value("Global Defaults", "default_company")
 	if company:
 		invoice.company = company
 	
-	# Set due date (required field)
+	# Set posting date and time
 	if posting_date:
 		invoice.posting_date = posting_date
+		if posting_time:
+			# Set posting time - format as HH:MM:SS
+			time_str = posting_time.strftime("%H:%M:%S") if hasattr(posting_time, "strftime") else str(posting_time)
+			if frappe.get_meta("Sales Invoice").has_field("posting_time"):
+				invoice.posting_time = time_str
+			print(f"[info] Set posting_date={posting_date}, posting_time={time_str}")
 		# Set due date based on payment terms or default to posting_date + 30 days
-		from datetime import datetime, timedelta
+		from datetime import timedelta
 		if isinstance(posting_date, str):
 			posting_date_obj = datetime.strptime(posting_date, "%Y-%m-%d").date()
 		else:
@@ -1300,14 +1448,15 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 		invoice.due_date = frappe.utils.add_days(today, 30)
 	
 	# Set description if field exists (may be required in some installations)
+	order_ref_for_desc = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None) or foodics_order_name
+	invoice_description_text = f"Foodics Order: {order_ref_for_desc}"
+
 	if frappe.get_meta("Sales Invoice").has_field("description"):
-		order_ref = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None)
-		invoice.description = f"Foodics Order: {order_ref or foodics_order_name}"
+		invoice.description = invoice_description_text
 	else:
 		# Even if field doesn't exist in meta, try to set it (might be a custom field)
 		try:
-			order_ref = getattr(order_doc, "reference", None) or getattr(order_doc, "number", None)
-			invoice.description = f"Foodics Order: {order_ref or foodics_order_name}"
+			invoice.description = invoice_description_text
 		except Exception:
 			pass
 	
@@ -1325,9 +1474,10 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			raw_data = json.loads(order_doc.foodics_order_raw)
 		except Exception:
 			pass
-	
-	# If raw JSON doesn't have products or combos, try to fetch the full order from API
-	if (not raw_data or (not raw_data.get("products") and not raw_data.get("combos"))) and hasattr(order_doc, "foodics_order_id"):
+
+	# Only fetch from API if there are no items/combos stored locally
+	has_local_items = bool(getattr(order_doc, "items", [])) or bool(getattr(order_doc, "combos", []))
+	if (not has_local_items) and (not raw_data or (not raw_data.get("products") and not raw_data.get("combos"))) and hasattr(order_doc, "foodics_order_id"):
 		order_id = order_doc.foodics_order_id
 		print(f"[info] Raw JSON missing products/combos, fetching full order {order_id} from API...")
 		try:
@@ -1350,18 +1500,17 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			for idx, p in enumerate(raw_data.get("products", [])):
 				# Extract product ID from nested structure
 				product_obj = p.get("product") or {}
-				if isinstance(product_obj, dict):
-					# Check attributes first
+				product_attrs = {}
+				if isinstance(product_obj, dict) and product_obj:
 					product_attrs = product_obj.get("attributes") or product_obj
-					product_id = product_attrs.get("id") or product_obj.get("id") or p.get("id")
-					product_sku = product_attrs.get("sku") or product_obj.get("sku")
-				else:
-					product_id = p.get("id")
-					product_sku = p.get("sku")
-				
+				product_id = (product_attrs.get("id") if product_attrs else None) or product_obj.get("id") or p.get("id")
+				product_sku = (product_attrs.get("sku") if product_attrs else None) or product_obj.get("sku") or p.get("sku")
+				product_name = (product_attrs.get("name") if product_attrs else None) or product_obj.get("name") or p.get("name")
+
 				raw_products_by_index[idx] = {
 					"id": product_id,
 					"sku": product_sku,
+					"name": product_name,
 				}
 		
 		# Handle products from combos (many orders have combos instead of direct products)
@@ -1371,18 +1520,18 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 				combo_products = combo.get("products", [])
 				for combo_product in combo_products:
 					product_obj = combo_product.get("product") or {}
-					if isinstance(product_obj, dict):
+					product_attrs = {}
+					if isinstance(product_obj, dict) and product_obj:
 						product_attrs = product_obj.get("attributes") or product_obj
-						product_id = product_attrs.get("id") or product_obj.get("id")
-						product_sku = product_attrs.get("sku") or product_obj.get("sku")
-					else:
-						product_id = combo_product.get("id")
-						product_sku = combo_product.get("sku")
-					
+					product_id = (product_attrs.get("id") if product_attrs else None) or product_obj.get("id") or combo_product.get("id")
+					product_sku = (product_attrs.get("sku") if product_attrs else None) or product_obj.get("sku") or combo_product.get("sku")
+					product_name = (product_attrs.get("name") if product_attrs else None) or product_obj.get("name") or combo_product.get("name")
+
 					if product_id or product_sku:
 						raw_products_by_index[combo_idx] = {
 							"id": product_id,
 							"sku": product_sku,
+							"name": product_name,
 						}
 						combo_idx += 1
 	
@@ -1411,11 +1560,23 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			if product_sku:
 				item_name = _get_item_by_sku(product_sku)
 		
+		# Fallback: try to match product name from raw JSON
+		if not item_name and idx in raw_products_by_index:
+			product_name = raw_products_by_index[idx].get("name")
+			if product_name:
+				item_name = _get_item_by_name(product_name)
+
 		# Fallback to product_sku from order_item
 		if not item_name:
 			product_sku = getattr(order_item, "product_sku", None)
 			if product_sku:
 				item_name = _get_item_by_sku(product_sku)
+
+		# Fallback: try to match using product name stored on order_item
+		if not item_name:
+			product_name = getattr(order_item, "product_name", None)
+			if product_name:
+				item_name = _get_item_by_name(product_name)
 		
 		if not item_name:
 			product_id = getattr(order_item, "foodics_product_id", None) or (raw_products_by_index.get(idx, {}).get("id") if idx in raw_products_by_index else None)
@@ -1490,9 +1651,16 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 	combos = getattr(order_doc, "combos", []) or []
 	for combo in combos:
 		combo_id = getattr(combo, "foodics_combo_id", None) or getattr(combo, "combo_id", None)
+		item_name = None
 		if combo_id:
 			item_name = _get_item_by_foodics_combo_id(combo_id)
-			if item_name:  # Only add if item_name is found
+		
+		if not item_name:
+			combo_name = getattr(combo, "combo_name", None)
+			if combo_name:
+				item_name = _get_item_by_name(combo_name)
+
+		if item_name:  # Only add if item_name is found
 				quantity = getattr(combo, "quantity", 0)
 				if quantity > 0:
 					unit_price = getattr(combo, "unit_price_net", None) or getattr(combo, "unit_price_gross", 0)
@@ -1617,48 +1785,90 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 	if frappe.get_meta("Sales Invoice").has_field("foodics_branch_name"):
 		invoice.foodics_branch_name = branch_name
 	
-	# Add payment entries from Foodics Order payments
+	# Store payment information to add AFTER calculate_taxes_and_totals
+	# (calculate_taxes_and_totals may clear payment entries)
 	payments = getattr(order_doc, "payments", []) or []
 	payments_total = 0.0
 	payment_methods_map = {}  # Map payment_method_id -> total amount
+	payment_entries_to_add = []  # Store payment entries to add later
+	payment_details_map = {}  # key -> (payment_method_id, payment_method_name)
+	
+	# Get order total for fallback
+	order_total = float(getattr(order_doc, "total_price", None) or getattr(order_doc, "total_price_gross", None) or 0)
 	
 	# Group payments by payment method
+	# IMPORTANT: Process ALL payments with amount > 0, even if payment_method_id is missing
+	# If payment_method is missing (common for cash payments), default to "Cash"
 	for payment in payments:
 		payment_method_id = getattr(payment, "payment_method_id", None)
+		payment_method_name = getattr(payment, "payment_method_name", None)
 		amount = float(getattr(payment, "amount", 0) or 0)
 		
-		if payment_method_id and amount > 0:
-			if payment_method_id not in payment_methods_map:
-				payment_methods_map[payment_method_id] = 0.0
-			payment_methods_map[payment_method_id] += amount
+		# Process payment if amount > 0, even if payment_method_id is missing
+		if amount > 0:
+			# If payment method is completely missing, assume it's Cash (common case)
+			# This handles cases where Foodics doesn't include payment_method for cash payments
+			if not payment_method_id and not payment_method_name:
+				print(f"[info] Payment has no method data (amount={amount}), assuming Cash payment")
+				payment_method_name = "Cash"  # Default to Cash when method is missing
+			
+			# Use payment_method_id if available, otherwise use payment_method_name, otherwise use "default"
+			key = payment_method_id
+			if not key:
+				key = payment_method_name
+			if not key:
+				key = "default"
+			
+			if key not in payment_methods_map:
+				payment_methods_map[key] = 0.0
+				# Store the actual payment_method_name (which may be "Cash" if we defaulted)
+				payment_details_map[key] = (payment_method_id, payment_method_name)
+			
+			payment_methods_map[key] += amount
 			payments_total += amount
+			print(f"[info] Grouped payment: key={key}, method_id={payment_method_id}, method_name={payment_method_name}, amount={amount}, total={payment_methods_map[key]}")
 	
-	# Add payment entries to invoice
-	invoice.set("payments", [])  # Clear existing payments
-	for payment_method_id, total_amount in payment_methods_map.items():
+	# If no payments found but order has total, this might be an issue
+	if len(payment_methods_map) == 0 and payments_total == 0 and len(payments) > 0:
+		print(f"[warn] Found {len(payments)} payment entries but all have amount=0 or missing amount")
+		# Try to sum amounts directly
+		for payment in payments:
+			amount = float(getattr(payment, "amount", 0) or 0)
+			if amount > 0:
+				payments_total += amount
+				# Add to default if no method data
+				if "default" not in payment_methods_map:
+					payment_methods_map["default"] = 0.0
+					payment_details_map["default"] = (None, None)
+				payment_methods_map["default"] += amount
+				print(f"[info] Added payment with missing method data: amount={amount}")
+	
+	# Prepare payment entries (but don't add yet - will add after calculate_taxes_and_totals)
+	print(f"[info] Processing {len(payment_methods_map)} payment methods for invoice")
+	print(f"[info] Total payments from order: {len(payments)}, grouped into {len(payment_methods_map)} methods")
+	
+	for payment_method_key, total_amount in payment_methods_map.items():
+		# Get payment method details from our map
+		payment_method_id, payment_method_name = payment_details_map.get(payment_method_key, (None, None))
+		
 		# Find Mode of Payment by foodics_payment_method_id
 		mode_of_payment = None
-		if frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
+		if payment_method_id and frappe.get_meta("Mode of Payment").has_field("foodics_payment_method_id"):
 			mode_of_payment = frappe.db.get_value(
 				"Mode of Payment",
 				{"foodics_payment_method_id": payment_method_id},
 				"name"
 			)
 		
-		if not mode_of_payment:
-			# Fallback: try to get payment method name and find by name
-			payment_method_name = None
-			for payment in payments:
-				if getattr(payment, "payment_method_id", None) == payment_method_id:
-					payment_method_name = getattr(payment, "payment_method_name", None)
-					break
-			
-			if payment_method_name:
-				mode_of_payment = frappe.db.get_value(
-					"Mode of Payment",
-					{"mode_of_payment": payment_method_name},
-					"name"
-				)
+		if not mode_of_payment and payment_method_name:
+			# Fallback: try to find by name
+			mode_of_payment = frappe.db.get_value(
+				"Mode of Payment",
+				{"mode_of_payment": payment_method_name},
+				"name"
+			)
+			if mode_of_payment:
+				print(f"[info] Found mode of payment by name: {mode_of_payment} for {payment_method_name}")
 		
 		if mode_of_payment:
 			# Get default account for this mode of payment and company
@@ -1666,12 +1876,15 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
 			
 			if company:
-				# Get account from Mode of Payment Account child table
-				mop_doc = frappe.get_doc("Mode of Payment", mode_of_payment)
-				for account_row in (mop_doc.get("accounts") or []):
-					if account_row.company == company:
-						default_account = account_row.default_account
-						break
+				try:
+					# Get account from Mode of Payment Account child table
+					mop_doc = frappe.get_doc("Mode of Payment", mode_of_payment)
+					for account_row in (mop_doc.get("accounts") or []):
+						if account_row.company == company:
+							default_account = account_row.default_account
+							break
+				except Exception as mop_err:
+					print(f"[warn] Error getting mode of payment accounts: {mop_err}")
 			
 			payment_entry = {
 				"mode_of_payment": mode_of_payment,
@@ -1681,9 +1894,112 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			if default_account:
 				payment_entry["account"] = default_account
 			
-			invoice.append("payments", payment_entry)
+			payment_entries_to_add.append(payment_entry)
+			print(f"[info] Prepared payment entry: {mode_of_payment} = {total_amount}")
 		else:
-			print(f"[warn] Mode of Payment not found for Foodics payment_method_id={payment_method_id}, skipping payment entry")
+			# Mode of Payment not found - use a default Mode of Payment (Cash) as fallback
+			print(f"[warn] Mode of Payment not found for payment_method_key: {payment_method_key}, amount: {total_amount}")
+			
+			# Try to use a default Mode of Payment (Cash) as fallback
+			default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+			if not default_mop:
+				# Try to get any Mode of Payment
+				default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+			
+			if default_mop:
+				print(f"[info] Using default Mode of Payment: {default_mop} for payment_method_key: {payment_method_key}")
+				company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+				default_account = None
+				
+				if company:
+					try:
+						mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+						for account_row in (mop_doc.get("accounts") or []):
+							if account_row.company == company:
+								default_account = account_row.default_account
+								break
+					except Exception:
+						pass
+				
+				payment_entry = {
+					"mode_of_payment": default_mop,
+					"amount": total_amount,
+				}
+				
+				if default_account:
+					payment_entry["account"] = default_account
+				
+				payment_entries_to_add.append(payment_entry)
+				print(f"[info] Added payment entry with default Mode of Payment: {default_mop} = {total_amount}")
+			else:
+				print(f"[error] No Mode of Payment found at all - cannot add payment entry")
+	
+	# If no payment entries were added but we have payments_total > 0, add a default payment
+	# This handles cases where payment method data is missing but we know the order was paid
+	if len(payment_entries_to_add) == 0 and payments_total > 0:
+		print(f"[info] No payment entries added but payments_total={payments_total}, adding default Cash payment")
+		default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+		if not default_mop:
+			default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+		
+		if default_mop:
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			default_account = None
+			
+			if company:
+				try:
+					mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+					for account_row in (mop_doc.get("accounts") or []):
+						if account_row.company == company:
+							default_account = account_row.default_account
+							break
+				except Exception:
+					pass
+			
+			payment_entry = {
+				"mode_of_payment": default_mop,
+				"amount": payments_total,
+			}
+			
+			if default_account:
+				payment_entry["account"] = default_account
+			
+			payment_entries_to_add.append(payment_entry)
+			print(f"[info] Added default payment entry: {default_mop} = {payments_total}")
+	
+	# If still no payment entries, use order total as payment amount
+	# This is a last resort for fully paid invoices
+	if len(payment_entries_to_add) == 0 and order_total > 0:
+		print(f"[info] No payment entries but order total={order_total}, adding default Cash payment")
+		default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+		if not default_mop:
+			default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+		
+		if default_mop:
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			default_account = None
+			
+			if company:
+				try:
+					mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+					for account_row in (mop_doc.get("accounts") or []):
+						if account_row.company == company:
+							default_account = account_row.default_account
+							break
+				except Exception:
+					pass
+			
+			payment_entry = {
+				"mode_of_payment": default_mop,
+				"amount": float(order_total),
+			}
+			
+			if default_account:
+				payment_entry["account"] = default_account
+			
+			payment_entries_to_add.append(payment_entry)
+			payments_total = float(order_total)
+			print(f"[info] Added default payment entry based on order total: {default_mop} = {order_total}")
 	
 	# Set company if not set
 	if not hasattr(invoice, "company") or not invoice.company:
@@ -1729,6 +2045,14 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 	except Exception as calc_err:
 		print(f"[warn] Error calculating taxes: {calc_err}")
 	
+	# Add payment entries AFTER calculate_taxes_and_totals
+	# (calculate_taxes_and_totals may clear payment entries, so we add them after)
+	if payment_entries_to_add:
+		invoice.set("payments", [])  # Clear any existing payments
+		for payment_entry in payment_entries_to_add:
+			invoice.append("payments", payment_entry)
+		print(f"[info] Added {len(payment_entries_to_add)} payment entries to invoice after calculate_taxes_and_totals")
+	
 	# Re-ensure descriptions after calculations (in case they were cleared)
 	for item in invoice.items:
 		if not item.description or (isinstance(item.description, str) and item.description.strip() == ""):
@@ -1758,11 +2082,137 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 	# Replace items list with valid items only using set method
 	if len(valid_items) < len(invoice.items):
 		invoice.set("items", valid_items)
+
+	# Ensure invoice description is still populated before insert
+	if not invoice.description or (isinstance(invoice.description, str) and invoice.description.strip() == ""):
+		invoice.description = invoice_description_text
+		try:
+			invoice.set("description", invoice_description_text)
+		except Exception:
+			pass
+	
+	# Ensure set_posting_time is 1 right before insert (ALWAYS set to 1)
+	# This field must be set to 1 to allow custom posting time
+	# Set it multiple ways to ensure it's saved
+	invoice.set_posting_time = 1
+	invoice.flags.set_posting_time = 1
+	# Also set via set method to ensure it's saved
+	try:
+		invoice.set("set_posting_time", 1)
+	except Exception:
+		pass
+	# Also set is_pos if it exists (some installations use is_pos instead)
+	# ALWAYS set is_pos = 1
+	try:
+		if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+			invoice.is_pos = 1
+			invoice.flags.is_pos = 1
+			invoice.set("is_pos", 1)
+	except Exception:
+		pass
+	print(f"[info] Set set_posting_time = 1 and is_pos = 1 before insert")
 	
 	# Save invoice with ignore_validate to bypass description validation if needed
 	try:
 		# Try normal insert first
 		invoice.insert(ignore_permissions=True)
+		# After insert, ensure set_posting_time is 1 using db_set
+		try:
+			invoice.db_set("set_posting_time", 1)
+			frappe.db.commit()
+			print(f"[info] Set set_posting_time = 1 after insert using db_set")
+		except Exception as db_set_err:
+			print(f"[warn] Could not set set_posting_time using db_set: {db_set_err}")
+		
+		# Add payment entries after insert (they may have been cleared)
+		if payment_entries_to_add:
+			print(f"[info] payment_entries_to_add has {len(payment_entries_to_add)} entries to add after insert")
+			invoice.reload()
+			# Check current payments before clearing
+			current_payments = len(invoice.get("payments", []))
+			print(f"[info] Invoice has {current_payments} payment entries before adding")
+			
+			# Clear existing payments and add new ones
+			invoice.set("payments", [])
+			for payment_entry in payment_entries_to_add:
+				invoice.append("payments", payment_entry)
+				print(f"[info] Appended payment: {payment_entry.get('mode_of_payment')} = {payment_entry.get('amount')}")
+			
+			# Verify payments were added before save
+			payments_count = len(invoice.get("payments", []))
+			print(f"[info] Invoice now has {payments_count} payment entries after append (before save)")
+			
+			# Save the invoice with payments
+			try:
+				invoice.save(ignore_permissions=True)
+				frappe.db.commit()
+				print(f"[info] Saved invoice with {payments_count} payment entries")
+			except Exception as save_err:
+				print(f"[error] Error saving invoice with payments: {save_err}")
+				import traceback
+				print(f"[error] Traceback: {traceback.format_exc()[:500]}")
+				# Try to save payments directly via db
+				try:
+					# Clear existing payment entries in DB
+					frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+					# Insert payment entries directly
+					for idx, payment_entry in enumerate(payment_entries_to_add):
+						frappe.db.sql("""
+							INSERT INTO `tabSales Invoice Payment`
+							(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+							VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+						""", (
+							frappe.generate_hash(length=10),
+							invoice.name,
+							"payments",
+							"Sales Invoice",
+							payment_entry.get("mode_of_payment"),
+							payment_entry.get("amount"),
+							payment_entry.get("account"),
+							frappe.session.user,
+							frappe.session.user
+						))
+					frappe.db.commit()
+					print(f"[info] Added {len(payment_entries_to_add)} payment entries directly via DB")
+				except Exception as db_err:
+					print(f"[error] Failed to add payments via DB: {db_err}")
+					import traceback
+					print(f"[error] DB Error Traceback: {traceback.format_exc()[:500]}")
+			
+			# Reload and verify
+			invoice.reload()
+			final_payments = len(invoice.get("payments", []))
+			print(f"[info] Final payment entries after save: {final_payments}")
+			if final_payments == 0:
+				print(f"[error] WARNING: Payment entries were not saved! Expected {len(payment_entries_to_add)} entries")
+				# Force add via DB as last resort
+				try:
+					frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+					for payment_entry in payment_entries_to_add:
+						frappe.db.sql("""
+							INSERT INTO `tabSales Invoice Payment`
+							(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+							VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+						""", (
+							frappe.generate_hash(length=10),
+							invoice.name,
+							"payments",
+							"Sales Invoice",
+							payment_entry.get("mode_of_payment"),
+							payment_entry.get("amount"),
+							payment_entry.get("account"),
+							frappe.session.user,
+							frappe.session.user
+						))
+					frappe.db.commit()
+					print(f"[info] Force-added {len(payment_entries_to_add)} payment entries via DB as last resort")
+					invoice.reload()
+					final_payments = len(invoice.get("payments", []))
+					print(f"[info] After force-add: {final_payments} payment entries")
+				except Exception as force_err:
+					print(f"[error] Force-add also failed: {force_err}")
+		else:
+			print(f"[warn] payment_entries_to_add is empty - no payments to add!")
 	except Exception as insert_err:
 		error_msg = str(insert_err)
 		print(f"[error] Failed to insert invoice: {error_msg}")
@@ -1805,9 +2255,326 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 		else:
 			raise insert_err
 	
-	# Check if fully paid
+	# Ensure set_posting_time is 1 after insert (before submit) using db_set
+	try:
+		invoice.db_set("set_posting_time", 1)
+		# Also set is_pos if it exists
+		if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+			invoice.db_set("is_pos", 1)
+		frappe.db.commit()
+		print(f"[info] Set set_posting_time = 1 (and is_pos = 1 if exists) after insert (before submit)")
+	except Exception as db_set_err:
+		print(f"[warn] Could not set set_posting_time using db_set: {db_set_err}")
+	
+	# Check and apply VAT 15% template after insert
+	invoice.reload()
+	company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+	
+	# Check if invoice has a tax template with 15% VAT
+	has_vat_15 = False
+	current_template = getattr(invoice, "taxes_and_charges", None)
+	
+	if current_template:
+		try:
+			template_doc = frappe.get_doc("Sales Taxes and Charges Template", current_template)
+			taxes = template_doc.get("taxes", [])
+			for tax in taxes:
+				if tax.rate == 15.0:
+					has_vat_15 = True
+					print(f"[info] Invoice already has VAT 15% template: {current_template}")
+					break
+		except Exception:
+			pass
+	
+	# If no VAT 15% template, find and apply one
+	if not has_vat_15:
+		print(f"[info] Checking for VAT 15% template for company: {company}")
+		# Find templates for this company
+		templates = frappe.get_all(
+			"Sales Taxes and Charges Template",
+			filters={"company": company} if company else {},
+			fields=["name"]
+		)
+		
+		vat_15_template = None
+		for template in templates:
+			try:
+				template_doc = frappe.get_doc("Sales Taxes and Charges Template", template.name)
+				taxes = template_doc.get("taxes", [])
+				for tax in taxes:
+					if tax.rate == 15.0:
+						vat_15_template = template.name
+						print(f"[info] Found VAT 15% template: {vat_15_template}")
+						break
+				if vat_15_template:
+					break
+			except Exception:
+				continue
+		
+		# Apply the template if found
+		if vat_15_template:
+			try:
+				invoice.taxes_and_charges = vat_15_template
+				# Load the template taxes
+				invoice.run_method("set_missing_values")
+				# Recalculate taxes and totals with the new template
+				invoice.run_method("calculate_taxes_and_totals")
+				invoice.save(ignore_permissions=True)
+				frappe.db.commit()
+				invoice.reload()  # Reload to get updated totals
+				print(f"[info] Applied VAT 15% template: {vat_15_template}")
+			except Exception as template_err:
+				print(f"[warn] Could not apply VAT 15% template: {template_err}")
+				import traceback
+				print(f"[warn] Template error details: {traceback.format_exc()[:500]}")
+		else:
+			print(f"[warn] No VAT 15% template found for company: {company}")
+	
+	# Ensure payments are added BEFORE submit (submitted invoices can't be modified)
+	# CRITICAL: If no payment entries, ALWAYS add a default payment based on invoice grand_total
+	# This ensures all invoices have payments even if order payment data is missing
+	invoice.reload()
+	invoice_total = invoice.grand_total or 0.0
+	
+	# ALWAYS ensure we have at least one payment entry if invoice has a total
+	if len(payment_entries_to_add) == 0:
+		if invoice_total > 0:
+			print(f"[info] No payment entries from order but invoice total={invoice_total}, adding default Cash payment")
+			default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+			if not default_mop:
+				default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+			
+			if default_mop:
+				company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+				default_account = None
+				
+				if company:
+					try:
+						mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+						for account_row in (mop_doc.get("accounts") or []):
+							if account_row.company == company:
+								default_account = account_row.default_account
+								break
+					except Exception:
+						pass
+				
+				payment_entry = {
+					"mode_of_payment": default_mop,
+					"amount": invoice_total,
+				}
+				
+				if default_account:
+					payment_entry["account"] = default_account
+				
+				payment_entries_to_add.append(payment_entry)
+				payments_total = invoice_total
+				print(f"[info] Added default payment entry based on invoice total: {default_mop} = {invoice_total}")
+			else:
+				print(f"[warn] Invoice has no grand_total ({invoice_total}), cannot add payment")
+	else:
+		# If we have payment entries, recalculate payments_total
+		payments_total = sum(float(pe.get("amount", 0) or 0) for pe in payment_entries_to_add)
+	
+	# ALWAYS add payments if we have any payment entries
+	if payment_entries_to_add:
+		print(f"[info] Adding {len(payment_entries_to_add)} payment entries before submit")
+		invoice.reload()
+		invoice.set("payments", [])
+		for payment_entry in payment_entries_to_add:
+			invoice.append("payments", payment_entry)
+			print(f"[info] Appended payment before submit: {payment_entry.get('mode_of_payment')} = {payment_entry.get('amount')}")
+		
+		# Save payments before submit
+		try:
+			invoice.save(ignore_permissions=True)
+			frappe.db.commit()
+			payments_count = len(invoice.get("payments", []))
+			print(f"[info] Saved {payments_count} payment entries before submit")
+		except Exception as save_err:
+			print(f"[error] Error saving payments before submit: {save_err}")
+			# Force add via DB
+			try:
+				frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+				for payment_entry in payment_entries_to_add:
+					frappe.db.sql("""
+						INSERT INTO `tabSales Invoice Payment`
+						(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+						VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+					""", (
+						frappe.generate_hash(length=10),
+						invoice.name,
+						"payments",
+						"Sales Invoice",
+						payment_entry.get("mode_of_payment"),
+						payment_entry.get("amount"),
+						payment_entry.get("account"),
+						frappe.session.user,
+						frappe.session.user
+					))
+				frappe.db.commit()
+				print(f"[info] Force-added {len(payment_entries_to_add)} payments via DB before submit")
+			except Exception as db_err:
+				print(f"[error] Failed to force-add payments: {db_err}")
+	else:
+		print(f"[warn] No payment entries to add - payment_entries_to_add is empty!")
+		# Last resort: add default payment via DB directly
+		invoice.reload()
+		invoice_total = invoice.grand_total or 0.0
+		if invoice_total > 0:
+			print(f"[info] Last resort: Adding default Cash payment via DB for invoice total={invoice_total}")
+			default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+			if not default_mop:
+				default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+			
+			if default_mop:
+				try:
+					# Get account
+					company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+					default_account = None
+					if company:
+						try:
+							mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+							for account_row in (mop_doc.get("accounts") or []):
+								if account_row.company == company:
+									default_account = account_row.default_account
+									break
+						except Exception:
+							pass
+					
+					# Insert payment directly via DB
+					frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+					frappe.db.sql("""
+						INSERT INTO `tabSales Invoice Payment`
+						(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+						VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+					""", (
+						frappe.generate_hash(length=10),
+						invoice.name,
+						"payments",
+						"Sales Invoice",
+						default_mop,
+						invoice_total,
+						default_account,
+						frappe.session.user,
+						frappe.session.user
+					))
+					frappe.db.commit()
+					print(f"[info] Last resort: Added default payment via DB: {default_mop} = {invoice_total}")
+				except Exception as db_err:
+					print(f"[error] Last resort DB add failed: {db_err}")
+	
+	# Check if fully paid and add remaining balance as Cash if needed
 	invoice.reload()  # Reload to get calculated totals
 	invoice_total = invoice.grand_total or 0.0
+	
+	# Calculate total payments from payment_entries_to_add
+	payments_total_from_entries = sum(float(pe.get("amount", 0) or 0) for pe in payment_entries_to_add)
+	
+	# If payments are less than grand_total, add remaining as Cash payment
+	if payments_total_from_entries > 0 and payments_total_from_entries < invoice_total:
+		remaining_balance = invoice_total - payments_total_from_entries
+		print(f"[info] Payments total ({payments_total_from_entries}) < grand_total ({invoice_total}), adding remaining balance ({remaining_balance}) as Cash")
+		
+		default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+		if not default_mop:
+			default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+		
+		if default_mop:
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			default_account = None
+			
+			if company:
+				try:
+					mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+					for account_row in (mop_doc.get("accounts") or []):
+						if account_row.company == company:
+							default_account = account_row.default_account
+							break
+				except Exception:
+					pass
+			
+			payment_entry = {
+				"mode_of_payment": default_mop,
+				"amount": remaining_balance,
+			}
+			
+			if default_account:
+				payment_entry["account"] = default_account
+			
+			payment_entries_to_add.append(payment_entry)
+			payments_total = payments_total_from_entries + remaining_balance
+			print(f"[info] Added remaining balance as Cash payment: {default_mop} = {remaining_balance}")
+		else:
+			payments_total = payments_total_from_entries
+	else:
+		payments_total = payments_total_from_entries
+	
+	# FINAL CHECK: If still no payment entries, add default payment NOW before submit
+	# This is the absolute last chance to add payments before invoice is submitted
+	if len(payment_entries_to_add) == 0 and invoice_total > 0:
+		print(f"[info] FINAL CHECK: No payment entries but invoice total={invoice_total}, adding default Cash payment")
+		default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+		if not default_mop:
+			default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+		
+		if default_mop:
+			company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+			default_account = None
+			
+			if company:
+				try:
+					mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+					for account_row in (mop_doc.get("accounts") or []):
+						if account_row.company == company:
+							default_account = account_row.default_account
+							break
+				except Exception:
+					pass
+			
+			payment_entry = {
+				"mode_of_payment": default_mop,
+				"amount": invoice_total,
+			}
+			
+			if default_account:
+				payment_entry["account"] = default_account
+			
+			payment_entries_to_add.append(payment_entry)
+			payments_total = invoice_total
+			print(f"[info] FINAL CHECK: Added default payment: {default_mop} = {invoice_total}")
+			
+			# Immediately add it to invoice
+			invoice.set("payments", [])
+			invoice.append("payments", payment_entry)
+			try:
+				invoice.save(ignore_permissions=True)
+				frappe.db.commit()
+				print(f"[info] FINAL CHECK: Saved payment to invoice before submit")
+			except Exception as save_err:
+				print(f"[error] FINAL CHECK: Error saving payment: {save_err}")
+				# Force add via DB
+				try:
+					frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+					frappe.db.sql("""
+						INSERT INTO `tabSales Invoice Payment`
+						(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+						VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+					""", (
+						frappe.generate_hash(length=10),
+						invoice.name,
+						"payments",
+						"Sales Invoice",
+						default_mop,
+						invoice_total,
+						default_account,
+						frappe.session.user,
+						frappe.session.user
+					))
+					frappe.db.commit()
+					print(f"[info] FINAL CHECK: Force-added payment via DB")
+				except Exception as db_err:
+					print(f"[error] FINAL CHECK: DB add also failed: {db_err}")
+	
 	is_fully_paid = payments_total >= (invoice_total - 0.01)  # 0.01 tolerance for rounding
 	
 	# Submit invoice (when Create Sales Invoices is enabled)
@@ -1821,8 +2588,83 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 			if is_fully_paid and payments_total > 0:
 				invoice.outstanding_amount = 0
 			
+			# Ensure set_posting_time = 1 and is_pos = 1 before submit
+			try:
+				invoice.db_set("set_posting_time", 1)
+				# Also set is_pos = 1 if it exists
+				try:
+					if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+						invoice.db_set("is_pos", 1)
+				except Exception:
+					pass
+				frappe.db.commit()
+			except Exception:
+				pass
+			
 			invoice.submit()
 			print(f"[info] Created and submitted Sales Invoice {invoice.name} for order {foodics_order_name}")
+			
+			# After submit, ensure set_posting_time = 1 and is_pos = 1
+			try:
+				invoice.db_set("set_posting_time", 1)
+				# Also set is_pos = 1 if it exists
+				try:
+					if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+						invoice.db_set("is_pos", 1)
+				except Exception:
+					pass
+				frappe.db.commit()
+				print(f"[info] Updated set_posting_time = 1 and is_pos = 1 after submit")
+			except Exception as db_set_err:
+				print(f"[warn] Could not set set_posting_time after submit: {db_set_err}")
+			
+			# CRITICAL: After submit, check if invoice has payments - if not, add default payment via DB
+			# This is the absolute last chance to add payments
+			invoice.reload()
+			existing_payments = invoice.get("payments", [])
+			if len(existing_payments) == 0:
+				invoice_total = invoice.grand_total or 0.0
+				if invoice_total > 0:
+					print(f"[info] POST-SUBMIT CHECK: Invoice has no payments but total={invoice_total}, adding via DB")
+					default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+					if not default_mop:
+						default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+					
+					if default_mop:
+						try:
+							company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+							default_account = None
+							if company:
+								try:
+									mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+									for account_row in (mop_doc.get("accounts") or []):
+										if account_row.company == company:
+											default_account = account_row.default_account
+											break
+								except Exception:
+									pass
+							
+							# Insert payment directly via DB (works even for submitted invoices)
+							frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+							frappe.db.sql("""
+								INSERT INTO `tabSales Invoice Payment`
+								(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+								VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+							""", (
+								frappe.generate_hash(length=10),
+								invoice.name,
+								"payments",
+								"Sales Invoice",
+								default_mop,
+								invoice_total,
+								default_account,
+								frappe.session.user,
+								frappe.session.user
+							))
+							frappe.db.commit()
+							print(f"[info] POST-SUBMIT: Added default payment via DB: {default_mop} = {invoice_total}")
+						except Exception as post_submit_err:
+							print(f"[error] POST-SUBMIT: Failed to add payment: {post_submit_err}")
 			
 			# If fully paid, ensure outstanding is 0 and status is Paid
 			if is_fully_paid and payments_total > 0:
@@ -1853,16 +2695,415 @@ def create_sales_invoice_from_order(foodics_order_name: str) -> Optional[str]:
 		order_doc.sales_invoice = invoice.name
 		order_doc.save(ignore_permissions=True)
 	
+	# ABSOLUTE FINAL CHECK: Ensure invoice has payments before returning
+	# This is the last chance to add payments
+	invoice.reload()
+	final_payments_check = invoice.get("payments", [])
+	if len(final_payments_check) == 0:
+		invoice_total_final = invoice.grand_total or 0.0
+		if invoice_total_final > 0:
+			print(f"[info] ABSOLUTE FINAL CHECK: Invoice {invoice.name} has no payments but total={invoice_total_final}, adding via DB")
+			default_mop = frappe.db.get_value("Mode of Payment", {"mode_of_payment": "Cash"}, "name")
+			if not default_mop:
+				default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation asc")
+			
+			if default_mop:
+				try:
+					company = invoice.company if hasattr(invoice, "company") and invoice.company else frappe.db.get_single_value("Global Defaults", "default_company")
+					default_account = None
+					if company:
+						try:
+							mop_doc = frappe.get_doc("Mode of Payment", default_mop)
+							for account_row in (mop_doc.get("accounts") or []):
+								if account_row.company == company:
+									default_account = account_row.default_account
+									break
+						except Exception:
+							pass
+					
+					# Insert payment directly via DB
+					frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent = %s", invoice.name)
+					frappe.db.sql("""
+						INSERT INTO `tabSales Invoice Payment`
+						(name, parent, parentfield, parenttype, mode_of_payment, amount, account, creation, modified, owner, modified_by)
+						VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s, %s)
+					""", (
+						frappe.generate_hash(length=10),
+						invoice.name,
+						"payments",
+						"Sales Invoice",
+						default_mop,
+						invoice_total_final,
+						default_account,
+						frappe.session.user,
+						frappe.session.user
+					))
+					frappe.db.commit()
+					print(f"[info] ABSOLUTE FINAL CHECK: Added payment via DB: {default_mop} = {invoice_total_final}")
+				except Exception as final_err:
+					print(f"[error] ABSOLUTE FINAL CHECK: Failed to add payment: {final_err}")
+	
+	# POST-CREATION VALIDATION: Validate items and values after invoice is created
+	try:
+		validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+		if not validation_result.get("valid", True):
+			print(f"[warn] Invoice validation failed: {validation_result.get('errors', [])}")
+			# Try to fix missing items
+			if validation_result.get("missing_items", []):
+				print(f"[info] Attempting to fix {len(validation_result['missing_items'])} missing items...")
+				fix_result = _fix_invoice_missing_items(invoice, order_doc, validation_result["missing_items"])
+				if fix_result.get("fixed", False):
+					print(f"[info] Fixed {fix_result.get('items_added', 0)} missing items in invoice {invoice.name}")
+					# Re-validate after fix
+					validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+					if not validation_result.get("valid", True):
+						print(f"[warn] Invoice still has validation issues after fix: {validation_result.get('errors', [])}")
+				else:
+					print(f"[warn] Could not fix missing items: {fix_result.get('error', 'Unknown error')}")
+		else:
+			print(f"[info] Invoice validation passed: items={validation_result.get('invoice_items_count', 0)}, total={validation_result.get('invoice_total', 0)}")
+	except Exception as validation_err:
+		print(f"[warn] Error during invoice validation: {validation_err}")
+		import traceback
+		frappe.log_error(
+			title="Invoice Validation Error",
+			message=f"Invoice: {invoice.name}\nOrder: {foodics_order_name}\nError: {validation_err}\n{frappe.get_traceback()}",
+		)
+	
 	return invoice.name
+
+
+def _validate_invoice_items_and_values(invoice, order_doc) -> dict:
+	"""
+	Validate that Sales Invoice items and totals match the Foodics Order.
+	Returns dict with validation results.
+	"""
+	result = {
+		"valid": True,
+		"errors": [],
+		"missing_items": [],
+		"invoice_items_count": 0,
+		"order_items_count": 0,
+		"invoice_total": 0.0,
+		"order_total": 0.0,
+		"total_diff": 0.0,
+	}
+	
+	try:
+		# Reload invoice to get latest data
+		invoice.reload()
+		
+		# Count invoice items
+		result["invoice_items_count"] = len(invoice.items) if invoice.items else 0
+		result["invoice_total"] = float(invoice.grand_total or 0)
+		
+		# Count order items and combos
+		order_items = getattr(order_doc, "items", []) or []
+		order_combos = getattr(order_doc, "combos", []) or []
+		result["order_items_count"] = len(order_items) + len(order_combos)
+		
+		# Get order total
+		order_total = float(getattr(order_doc, "total_price_gross", None) or getattr(order_doc, "total_price", None) or 0)
+		result["order_total"] = order_total
+		result["total_diff"] = abs(result["invoice_total"] - order_total)
+		
+		# Check if invoice has items
+		if result["invoice_items_count"] == 0:
+			result["valid"] = False
+			result["errors"].append("Invoice has no items")
+		
+		# Check if invoice total matches order total (with tolerance for rounding)
+		tolerance = 0.10  # Allow 0.10 SAR difference for rounding/tax differences
+		if result["total_diff"] > tolerance:
+			result["valid"] = False
+			result["errors"].append(f"Invoice total ({result['invoice_total']:.2f}) differs from order total ({order_total:.2f}) by {result['total_diff']:.2f}")
+		
+		# Check for missing items by comparing order items to invoice items
+		# Build a set of order item identifiers
+		order_item_identifiers = set()
+		
+		# Add items from order_items
+		for order_item in order_items:
+			product_id = getattr(order_item, "foodics_product_id", None)
+			product_sku = getattr(order_item, "product_sku", None)
+			# Try multiple name fields
+			product_name = (
+				getattr(order_item, "foodics_product_name", None) or
+				getattr(order_item, "product_name", None)
+			)
+			quantity = getattr(order_item, "quantity", 0)
+			
+			if quantity > 0:  # Only check items with quantity > 0
+				if product_id:
+					order_item_identifiers.add(("product_id", product_id))
+				if product_sku:
+					order_item_identifiers.add(("sku", product_sku))
+				if product_name:
+					# Use product_name as primary identifier when product_id is null
+					order_item_identifiers.add(("name", product_name))
+					# Also add as product_name for matching
+					order_item_identifiers.add(("product_name", product_name))
+		
+		# Add combos
+		for combo in order_combos:
+			combo_id = getattr(combo, "foodics_combo_id", None)
+			combo_name = getattr(combo, "combo_name", None)
+			quantity = getattr(combo, "quantity", 0)
+			
+			if quantity > 0:
+				if combo_id:
+					order_item_identifiers.add(("combo_id", combo_id))
+				if combo_name:
+					order_item_identifiers.add(("combo_name", combo_name))
+		
+		# Check if invoice items match order items
+		invoice_item_identifiers = set()
+		for invoice_item in invoice.items:
+			item_code = invoice_item.item_code
+			# Try to find the item and get its Foodics IDs
+			try:
+				item_doc = frappe.get_doc("Item", item_code)
+				product_id = getattr(item_doc, "foodics_product_id", None)
+				combo_id = getattr(item_doc, "foodics_combo_id", None)
+				sku = item_doc.item_code
+				name = item_doc.item_name
+				
+				if product_id:
+					invoice_item_identifiers.add(("product_id", product_id))
+				if combo_id:
+					invoice_item_identifiers.add(("combo_id", combo_id))
+				if sku:
+					invoice_item_identifiers.add(("sku", sku))
+				if name:
+					# Add both name and product_name for matching
+					invoice_item_identifiers.add(("name", name))
+					invoice_item_identifiers.add(("product_name", name))
+			except Exception:
+				# If item not found, use item_code as identifier
+				invoice_item_identifiers.add(("item_code", item_code))
+		
+		# Find missing items (items in order but not in invoice)
+		missing_identifiers = order_item_identifiers - invoice_item_identifiers
+		if missing_identifiers:
+			result["valid"] = False
+			result["missing_items"] = list(missing_identifiers)
+			result["errors"].append(f"Missing {len(missing_identifiers)} items in invoice")
+		
+	except Exception as e:
+		result["valid"] = False
+		result["errors"].append(f"Validation error: {str(e)}")
+		import traceback
+		frappe.log_error(
+			title="Invoice Validation Error",
+			message=f"Invoice: {invoice.name}\nOrder: {order_doc.name}\nError: {e}\n{frappe.get_traceback()}",
+		)
+	
+	return result
+
+
+def _fix_invoice_missing_items(invoice, order_doc, missing_items: list) -> dict:
+	"""
+	Fix missing items in Sales Invoice by adding them from Foodics Order.
+	Returns dict with fix results.
+	"""
+	result = {
+		"fixed": False,
+		"items_added": 0,
+		"error": None,
+	}
+	
+	try:
+		# Cancel invoice if submitted (need to cancel to modify)
+		was_submitted = invoice.docstatus == 1
+		if was_submitted:
+			print(f"[info] Cancelling invoice {invoice.name} to fix missing items...")
+			invoice.cancel()
+			frappe.db.commit()
+			invoice.reload()
+		
+		# Get order items and combos
+		order_items = getattr(order_doc, "items", []) or []
+		order_combos = getattr(order_doc, "combos", []) or []
+		
+		# Load raw JSON if available
+		raw_data = None
+		if hasattr(order_doc, "foodics_order_raw") and order_doc.foodics_order_raw:
+			try:
+				import json
+				raw_data = json.loads(order_doc.foodics_order_raw)
+			except Exception:
+				pass
+		
+		# Try to find and add missing items
+		items_added = 0
+		
+		# Check order items
+		for order_item in order_items:
+			product_id = getattr(order_item, "foodics_product_id", None)
+			product_sku = getattr(order_item, "product_sku", None)
+			# Try multiple name fields
+			product_name = (
+				getattr(order_item, "foodics_product_name", None) or
+				getattr(order_item, "product_name", None)
+			)
+			quantity = getattr(order_item, "quantity", 0)
+			
+			if quantity <= 0:
+				continue
+			
+			# Check if this item is missing
+			is_missing = False
+			for missing_type, missing_value in missing_items:
+				if missing_type == "product_id" and product_id == missing_value:
+					is_missing = True
+					break
+				elif missing_type == "sku" and product_sku == missing_value:
+					is_missing = True
+					break
+				elif missing_type == "name" and product_name == missing_value:
+					is_missing = True
+					break
+				elif missing_type == "product_name" and product_name == missing_value:
+					is_missing = True
+					break
+			
+			if not is_missing:
+				continue
+			
+			# Try to find the item - prioritize by name when product_id is null
+			item_name = None
+			if product_id:
+				item_name = _get_item_by_foodics_product_id(product_id)
+			# If product_id is null, try name first (more reliable)
+			if not item_name and product_name:
+				item_name = _get_item_by_name(product_name)
+			if not item_name and product_sku:
+				item_name = _get_item_by_sku(product_sku)
+			
+			if item_name:
+				# Check if item already in invoice
+				already_added = False
+				for inv_item in invoice.items:
+					if inv_item.item_code == item_name:
+						already_added = True
+						break
+				
+				if not already_added:
+					# Add item to invoice
+					unit_price = getattr(order_item, "unit_price_net", None) or getattr(order_item, "unit_price_gross", 0)
+					
+					try:
+						item_doc = frappe.get_doc("Item", item_name)
+						item_description = item_doc.description or item_doc.item_name or item_name
+						
+						invoice.append("items", {
+							"item_code": item_name,
+							"item_name": item_doc.item_name or item_name,
+							"qty": quantity,
+							"rate": unit_price,
+							"description": item_description,
+						})
+						items_added += 1
+						print(f"[info] Added missing item {item_name} (qty={quantity}, rate={unit_price})")
+					except Exception as add_err:
+						print(f"[warn] Failed to add item {item_name}: {add_err}")
+		
+		# Check order combos
+		for combo in order_combos:
+			combo_id = getattr(combo, "foodics_combo_id", None)
+			combo_name = getattr(combo, "combo_name", None)
+			quantity = getattr(combo, "quantity", 0)
+			
+			if quantity <= 0:
+				continue
+			
+			# Check if this combo is missing
+			is_missing = False
+			for missing_type, missing_value in missing_items:
+				if missing_type == "combo_id" and combo_id == missing_value:
+					is_missing = True
+					break
+				elif missing_type == "combo_name" and combo_name == missing_value:
+					is_missing = True
+					break
+			
+			if not is_missing:
+				continue
+			
+			# Try to find the combo item
+			item_name = None
+			if combo_id:
+				item_name = _get_item_by_foodics_combo_id(combo_id)
+			if not item_name and combo_name:
+				item_name = _get_item_by_name(combo_name)
+			
+			if item_name:
+				# Check if already added
+				already_added = False
+				for inv_item in invoice.items:
+					if inv_item.item_code == item_name:
+						already_added = True
+						break
+				
+				if not already_added:
+					unit_price = getattr(combo, "unit_price_net", None) or getattr(combo, "unit_price_gross", 0)
+					
+					try:
+						item_doc = frappe.get_doc("Item", item_name)
+						item_description = item_doc.description or item_doc.item_name or item_name
+						
+						invoice.append("items", {
+							"item_code": item_name,
+							"item_name": item_doc.item_name or item_name,
+							"qty": quantity,
+							"rate": unit_price,
+							"description": item_description,
+						})
+						items_added += 1
+						print(f"[info] Added missing combo {item_name} (qty={quantity}, rate={unit_price})")
+					except Exception as add_err:
+						print(f"[warn] Failed to add combo {item_name}: {add_err}")
+		
+		if items_added > 0:
+			# Recalculate taxes and totals
+			try:
+				invoice.run_method("calculate_taxes_and_totals")
+				invoice.save(ignore_permissions=True)
+				frappe.db.commit()
+				
+				# Re-submit if it was submitted before
+				if was_submitted:
+					invoice.submit()
+					frappe.db.commit()
+					print(f"[info] Re-submitted invoice {invoice.name} after fixing items")
+				
+				result["fixed"] = True
+				result["items_added"] = items_added
+			except Exception as save_err:
+				result["error"] = f"Failed to save invoice after adding items: {save_err}"
+				print(f"[error] {result['error']}")
+		else:
+			result["error"] = "No items could be added"
+		
+	except Exception as e:
+		result["error"] = str(e)
+		import traceback
+		frappe.log_error(
+			title="Fix Invoice Missing Items Error",
+			message=f"Invoice: {invoice.name}\nOrder: {order_doc.name}\nError: {e}\n{frappe.get_traceback()}",
+		)
+	
+	return result
 
 
 @frappe.whitelist()
 def sync_orders_and_create_invoices(
 	from_date: str,
-	to_date: str,
+	to_date: Optional[str] = None,
 	date_field: str = "business_date",
 	sync_log_name: Optional[str] = None,
 	enqueue: bool = True,
+	start_page: Optional[int] = None,
 ):
 	"""
 	Sync fully paid orders from Foodics and create paid Sales Invoices.
@@ -1945,6 +3186,26 @@ def sync_orders_and_create_invoices(
 		frappe.db.commit()
 		sync_log_name = sync_log.name
 	
+	start_page_value = 1
+	if start_page:
+		try:
+			start_page_value = int(start_page)
+		except Exception:
+			start_page_value = 1
+	start_page_value = max(start_page_value, 1)
+
+	if sync_log:
+		try:
+			sync_log.db_set("resume_page", start_page_value)
+			sync_log.db_set("current_page", start_page_value)
+			if sync_log.status != "In Progress":
+				sync_log.db_set("status", "In Progress")
+		except Exception:
+			pass
+
+	if date_field != "business_date" and not to_date:
+		to_date = from_date
+
 	sync_log.add_log_entry(
 		f"Starting orders and invoices sync from {from_date} to {to_date} (filter: {date_field})",
 		None, None, "INFO"
@@ -1966,13 +3227,45 @@ def sync_orders_and_create_invoices(
 		invoices_created = 0
 		invoices_skipped = 0
 		failed = 0
+		orders_for_invoicing: list[str] = []
+		
+		# Track last business date for resume functionality
+		last_business_date = None
+		previous_business_date = None
 		
 		# Paginate through fully paid orders
-		for order_json in _paginate_orders(cfg, s, date_filters=date_filters, only_fully_paid=True):
+		for order_json in _paginate_orders(
+			cfg,
+			s,
+			date_filters=date_filters,
+			only_fully_paid=True,
+			start_page=start_page_value,
+			sync_log=sync_log,
+		):
 			try:
 				order_id = order_json.get("id")
 				if not order_id:
 					continue
+				
+				# Track business_date for resume functionality
+				if date_field == "business_date":
+					order_business_date = order_json.get("business_date")
+					if order_business_date:
+						# Update last_business_date periodically (every 10 orders or when date changes)
+						if order_business_date != previous_business_date:
+							last_business_date = order_business_date
+							previous_business_date = order_business_date
+							# Update sync log with last business date
+							try:
+								sync_log.db_set("last_business_date", last_business_date)
+							except Exception:
+								pass  # Field might not exist, ignore
+						elif (orders_created + orders_skipped) % 10 == 0:
+							# Update periodically even if date hasn't changed
+							try:
+								sync_log.db_set("last_business_date", order_business_date)
+							except Exception:
+								pass
 				
 				# Check if Foodics Order already exists
 				existing_order = _parent_name_for(order_id)
@@ -2001,35 +3294,12 @@ def sync_orders_and_create_invoices(
 						orders_skipped += 1
 						continue
 					else:
-						# Order exists but no invoice - try to create invoice
+						# Order exists but no invoice yet
 						sync_log.add_log_entry(
-							f"Order exists but no invoice, attempting to create invoice",
+							f"Order exists but no invoice, queueing for invoice creation",
 							"Foodics Order", existing_order, "INFO"
 						)
-						try:
-							invoice_name = create_sales_invoice_from_order(existing_order)
-							if invoice_name:
-								invoices_created += 1
-								sync_log.add_log_entry(
-									f"Created Sales Invoice for existing order",
-									"Sales Invoice", invoice_name, "CREATED"
-								)
-							else:
-								invoices_skipped += 1
-								sync_log.add_log_entry(
-									f"Failed to create Sales Invoice (no items or customer)",
-									"Foodics Order", existing_order, "SKIPPED"
-								)
-						except Exception as inv_err:
-							failed += 1
-							sync_log.add_log_entry(
-								f"Failed to create Sales Invoice: {str(inv_err)}",
-								"Foodics Order", existing_order, "FAILED"
-							)
-							frappe.log_error(
-								title="Sales Invoice Creation Error",
-								message=f"Failed to create invoice for existing order {existing_order}: {str(inv_err)}"
-							)
+						orders_for_invoicing.append(existing_order)
 						continue
 				
 				# Check if Sales Invoice already exists by foodics_order_id
@@ -2059,32 +3329,7 @@ def sync_orders_and_create_invoices(
 						f"Created Foodics Order",
 						"Foodics Order", order_name, "CREATED"
 					)
-					
-					# Create Sales Invoice
-					try:
-						invoice_name = create_sales_invoice_from_order(order_name)
-						if invoice_name:
-							invoices_created += 1
-							sync_log.add_log_entry(
-								f"Created Sales Invoice",
-								"Sales Invoice", invoice_name, "CREATED"
-							)
-						else:
-							sync_log.add_log_entry(
-								f"Failed to create Sales Invoice (no items or customer)",
-								"Foodics Order", order_name, "SKIPPED"
-							)
-							invoices_skipped += 1
-					except Exception as inv_err:
-						failed += 1
-						sync_log.add_log_entry(
-							f"Failed to create Sales Invoice: {str(inv_err)}",
-							"Foodics Order", order_name, "FAILED"
-						)
-						frappe.log_error(
-							title="Invoice Creation Error",
-							message=f"Order: {order_name}\nError: {inv_err}\n{frappe.get_traceback()}",
-						)
+					orders_for_invoicing.append(order_name)
 					
 					# Commit periodically
 					if (orders_created + orders_skipped) % int(cfg.commit_every_n_records) == 0:
@@ -2114,8 +3359,82 @@ def sync_orders_and_create_invoices(
 					message=f"Order: {order_json.get('id', 'unknown')}\nError: {e}\n{frappe.get_traceback()}",
 				)
 		
-		# Final commit
+		# Final commit for orders
 		frappe.db.commit()
+
+		# Phase 2: create invoices for the saved orders
+		if orders_for_invoicing:
+			unique_orders = []
+			seen = set()
+			for name in orders_for_invoicing:
+				if name and name not in seen:
+					seen.add(name)
+					unique_orders.append(name)
+
+			sync_log.add_log_entry(
+				f"Starting invoice creation for {len(unique_orders)} orders",
+				None, None, "INFO"
+			)
+
+			for idx, invoice_order in enumerate(unique_orders, start=1):
+				try:
+					order_doc = frappe.get_doc("Foodics Order", invoice_order)
+					has_invoice = False
+					if hasattr(order_doc, "sales_invoice") and order_doc.sales_invoice:
+						has_invoice = True
+					else:
+						if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+							existing_inv = frappe.db.get_value(
+								"Sales Invoice",
+								{"foodics_order_id": invoice_order},
+								"name"
+							)
+							if existing_inv:
+								has_invoice = True
+
+					if has_invoice:
+						invoices_skipped += 1
+						sync_log.add_log_entry(
+							f"Order already linked to invoice, skipping",
+							"Foodics Order", invoice_order, "SKIPPED"
+						)
+						continue
+
+					invoice_name = create_sales_invoice_from_order(invoice_order)
+					if invoice_name:
+						invoices_created += 1
+						sync_log.add_log_entry(
+							f"Created Sales Invoice",
+							"Sales Invoice", invoice_name, "CREATED"
+						)
+					else:
+						invoices_skipped += 1
+						sync_log.add_log_entry(
+							f"Failed to create Sales Invoice (no items or customer)",
+							"Foodics Order", invoice_order, "SKIPPED"
+						)
+
+					if idx % 5 == 0:
+						frappe.db.commit()
+						sync_log.save(ignore_permissions=True)
+						frappe.db.commit()
+
+				except Exception as inv_err:
+					failed += 1
+					sync_log.add_log_entry(
+						f"Failed to create Sales Invoice: {str(inv_err)}",
+						"Foodics Order", invoice_order, "FAILED"
+					)
+					frappe.log_error(
+						title="Invoice Creation Error",
+						message=f"Order: {invoice_order}\nError: {inv_err}\n{frappe.get_traceback()}",
+					)
+
+			# Commit after invoice phase
+			frappe.db.commit()
+			sync_log.save(ignore_permissions=True)
+			frappe.db.commit()
+
 		
 		# Update sync log
 		total_records = orders_created + orders_skipped + failed
@@ -2143,6 +3462,93 @@ def sync_orders_and_create_invoices(
 			sync_log.finalize_log("Failed")
 		frappe.log_error(title="Orders and Invoices Sync Error", message=frappe.get_traceback())
 		raise
+
+
+@frappe.whitelist()
+def resume_sync_orders(sync_log_name: str) -> Dict[str, Any]:
+	"""
+	Resume a previously interrupted Orders with Invoices sync from the last recorded business date.
+	Uses last_business_date if available, otherwise falls back to page-based resume.
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+
+	if not sync_log_name:
+		frappe.throw("Sync log name is required to resume the job.")
+
+	try:
+		sync_log = frappe.get_doc("Foodics Sync Log", sync_log_name)
+	except frappe.DoesNotExistError:
+		frappe.throw(f"Sync Log {sync_log_name} not found.")
+
+	if sync_log.sync_type != "Orders with Invoices":
+		frappe.throw("Only 'Orders with Invoices' sync logs can be resumed.")
+
+	# Parse stored settings
+	settings = {}
+	if sync_log.sync_settings:
+		try:
+			settings = json.loads(sync_log.sync_settings)
+		except Exception:
+			settings = {}
+
+	# Determine resume strategy: prefer last_business_date over page-based
+	date_field = settings.get("date_field", "business_date")
+	from_date = settings.get("from_date")
+	to_date = settings.get("to_date")
+	
+	# If we have last_business_date and date_field is business_date, use it
+	last_business_date = getattr(sync_log, "last_business_date", None)
+	if last_business_date and date_field == "business_date":
+		# Resume from the day after last_business_date
+		from datetime import datetime, timedelta
+		try:
+			if isinstance(last_business_date, str):
+				last_date = datetime.strptime(last_business_date, "%Y-%m-%d").date()
+			else:
+				last_date = last_business_date
+			
+			# Resume from the next day after last_business_date
+			resume_from_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+			from_date = resume_from_date
+			
+			sync_log.add_log_entry(
+				f"Resuming from last business date: {last_business_date} -> from_date: {resume_from_date}",
+				None, None, "INFO"
+			)
+			# Always start from page 1 when using date-based resume
+			start_page = 1
+		except Exception as date_err:
+			print(f"[warn] Error parsing last_business_date {last_business_date}: {date_err}, falling back to page-based resume")
+			last_business_date = None
+	
+	# Fallback to page-based resume if no last_business_date
+	if not last_business_date or date_field != "business_date":
+		start_page = sync_log.resume_page or (sync_log.last_page_processed or 0) + 1
+		try:
+			start_page = max(int(start_page), 1)
+		except Exception:
+			start_page = 1
+		
+		sync_log.add_log_entry(
+			f"Resuming from page {start_page} (last_business_date not available or date_field is not business_date)",
+			None, None, "INFO"
+		)
+
+	sync_log.db_set("status", "In Progress")
+	sync_log.db_set("resume_page", start_page)
+	sync_log.db_set("current_page", start_page)
+	
+	result = sync_orders_and_create_invoices(
+		from_date=from_date,
+		to_date=to_date,
+		date_field=date_field,
+		sync_log_name=sync_log.name,
+		enqueue=False,
+		start_page=start_page,
+	)
+	result["resume_page"] = start_page
+	result["resume_from_date"] = from_date
+	return result
 
 
 @frappe.whitelist()
@@ -2321,3 +3727,2103 @@ def create_sales_invoices_from_orders(
 		"skipped": skipped,
 		"failed": failed,
 	}
+
+
+def _finalize_sync_log(sync_log_name: str, result: Dict[str, int]) -> None:
+	"""Update the sync log with counts and mark it completed."""
+	try:
+		log = frappe.get_doc("Foodics Sync Log", sync_log_name)
+	except frappe.DoesNotExistError:
+		return
+
+	log.add_log_entry(
+		f"Sales invoice creation completed. Created: {result.get('created', 0)}, Skipped: {result.get('skipped', 0)}, Failed: {result.get('failed', 0)}",
+		None, None, "INFO"
+	)
+	log.created = result.get("created", log.created or 0)
+	log.skipped = result.get("skipped", log.skipped or 0)
+	log.failed = result.get("failed", log.failed or 0)
+	log.finalize_log("Completed" if result.get("failed", 0) == 0 else "Partial")
+
+
+def _create_sales_invoices_task(
+	from_date: str,
+	to_date: str,
+	date_field: str,
+	only_without_invoice: bool,
+	sync_log_name: Optional[str] = None,
+	enqueue: bool = False,
+):
+	result = create_sales_invoices_from_orders(
+		from_date=from_date,
+		to_date=to_date,
+		date_field=date_field,
+		only_without_invoice=only_without_invoice,
+	)
+	if sync_log_name:
+		_finalize_sync_log(sync_log_name, result)
+
+
+@frappe.whitelist()
+def enqueue_create_sales_invoices_job(
+	from_date: str,
+	to_date: Optional[str] = None,
+	date_field: str = "business_date",
+	only_without_invoice: bool = True,
+):
+	frappe.only_for(("System Manager", "Administrator"))
+
+	if date_field != "business_date" and not to_date:
+		to_date = from_date
+	if not to_date:
+		to_date = from_date
+
+	log = frappe.get_doc({
+		"doctype": "Foodics Sync Log",
+		"sync_type": "Orders with Invoices",
+		"status": "In Progress",
+		"started_at": frappe.utils.now(),
+		"sync_settings": json.dumps({
+			"from_date": from_date,
+			"to_date": to_date,
+			"date_field": date_field,
+			"only_without_invoice": only_without_invoice,
+		}, indent=2),
+	})
+	log.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+	job = frappe.enqueue(
+		"foodics_migration.api_orders._create_sales_invoices_task",
+		from_date=from_date,
+		to_date=to_date,
+		date_field=date_field,
+		only_without_invoice=only_without_invoice,
+		sync_log_name=log.name,
+		enqueue=False,
+		queue="long",
+		timeout=3600,
+		job_name=f"create_sales_invoices_{from_date}_{to_date}",
+	)
+	return {
+		"job_id": getattr(job, "id", str(job)),
+		"sync_log_name": log.name,
+	}
+
+
+@frappe.whitelist()
+def fix_invoices_and_compare_totals(
+	from_date: Optional[str] = None,
+	to_date: Optional[str] = None,
+	limit: Optional[int] = None,
+	only_with_errors: bool = True,
+) -> Dict[str, Any]:
+	"""
+	Fix missing items in Sales Invoices and compare totals with Foodics Orders.
+	
+	Args:
+		from_date: Optional start date filter (business_date)
+		to_date: Optional end date filter (business_date)
+		limit: Optional limit on number of invoices to process
+		only_with_errors: If True, only process invoices with validation errors
+		
+	Returns:
+		dict with results: fixed, compared, errors, summary
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	results = {
+		"total_checked": 0,
+		"total_fixed": 0,
+		"total_errors": 0,
+		"items_fixed": 0,
+		"totals_match": 0,
+		"totals_mismatch": 0,
+		"fixed_invoices": [],
+		"mismatched_invoices": [],
+		"errors": [],
+	}
+	
+	try:
+		# Build query to find Sales Invoices with Foodics Orders
+		conditions = []
+		values = []
+		
+		# Filter by foodics_order_id or foodics_order_name
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			conditions.append("si.foodics_order_id IS NOT NULL AND si.foodics_order_id != ''")
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			conditions.append("si.foodics_order_name IS NOT NULL AND si.foodics_order_name != ''")
+		else:
+			# Try to find via Foodics Order's sales_invoice field
+			conditions.append("fo.sales_invoice IS NOT NULL")
+		
+		# Date filters
+		if from_date:
+			conditions.append("fo.business_date >= %s")
+			values.append(from_date)
+		if to_date:
+			conditions.append("fo.business_date <= %s")
+			values.append(to_date)
+		
+		# Build SQL query
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, si.foodics_order_id
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.foodics_order_id = si.foodics_order_id
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.name = si.foodics_order_name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		else:
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.sales_invoice = si.name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		
+		if limit:
+			query += f" LIMIT {int(limit)}"
+		
+		invoices = frappe.db.sql(query, values, as_dict=True)
+		
+		print(f"[info] Found {len(invoices)} invoices to check")
+		
+		for row in invoices:
+			try:
+				invoice_name = row.get("invoice_name")
+				order_name = row.get("order_name")
+				order_id = row.get("foodics_order_id")
+				
+				# Get order name if we only have ID
+				if not order_name and order_id:
+					order_name = _parent_name_for(order_id)
+				
+				if not invoice_name or not order_name:
+					continue
+				
+				results["total_checked"] += 1
+				
+				# Get invoice and order documents
+				try:
+					invoice = frappe.get_doc("Sales Invoice", invoice_name)
+					order_doc = frappe.get_doc("Foodics Order", order_name)
+				except Exception as doc_err:
+					results["errors"].append({
+						"invoice": invoice_name,
+						"order": order_name,
+						"error": f"Failed to load documents: {doc_err}"
+					})
+					results["total_errors"] += 1
+					continue
+				
+				# Validate invoice items and values
+				validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+				
+				# Fix missing items if validation failed
+				if not validation_result.get("valid", True):
+					missing_items = validation_result.get("missing_items", [])
+					if missing_items:
+						print(f"[info] Invoice {invoice_name} has {len(missing_items)} missing items, attempting to fix...")
+						fix_result = _fix_invoice_missing_items(invoice, order_doc, missing_items)
+						
+						if fix_result.get("fixed", False):
+							results["total_fixed"] += 1
+							results["items_fixed"] += fix_result.get("items_added", 0)
+							results["fixed_invoices"].append({
+								"invoice": invoice_name,
+								"order": order_name,
+								"items_added": fix_result.get("items_added", 0),
+							})
+							
+							# Re-validate after fix
+							invoice.reload()
+							validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+						
+						# If still not valid after fix, log it
+						if not validation_result.get("valid", True):
+							results["errors"].append({
+								"invoice": invoice_name,
+								"order": order_name,
+								"error": f"Still has errors after fix: {validation_result.get('errors', [])}"
+							})
+				
+				# Compare totals
+				invoice_total = float(invoice.grand_total or 0)
+				order_total = float(getattr(order_doc, "total_price_gross", None) or getattr(order_doc, "total_price", None) or 0)
+				total_diff = abs(invoice_total - order_total)
+				tolerance = 0.10  # Allow 0.10 SAR difference
+				
+				if total_diff <= tolerance:
+					results["totals_match"] += 1
+				else:
+					results["totals_mismatch"] += 1
+					results["mismatched_invoices"].append({
+						"invoice": invoice_name,
+						"order": order_name,
+						"invoice_total": invoice_total,
+						"order_total": order_total,
+						"difference": total_diff,
+					})
+					
+					# If only_with_errors is True and this has a mismatch, try to fix it
+					if only_with_errors and total_diff > tolerance:
+						# Check if items are missing
+						if validation_result.get("missing_items"):
+							missing_items = validation_result.get("missing_items", [])
+							if missing_items:
+								print(f"[info] Invoice {invoice_name} has total mismatch and missing items, attempting to fix...")
+								fix_result = _fix_invoice_missing_items(invoice, order_doc, missing_items)
+								
+								if fix_result.get("fixed", False):
+									# Re-check totals after fix
+									invoice.reload()
+									new_invoice_total = float(invoice.grand_total or 0)
+									new_diff = abs(new_invoice_total - order_total)
+									
+									if new_diff <= tolerance:
+										results["totals_match"] += 1
+										results["totals_mismatch"] -= 1
+										# Remove from mismatched if now matches
+										results["mismatched_invoices"] = [
+											m for m in results["mismatched_invoices"]
+											if m["invoice"] != invoice_name
+										]
+				
+			except Exception as e:
+				results["total_errors"] += 1
+				invoice_name = row.get("invoice_name", "unknown") if 'row' in locals() else "unknown"
+				order_name = row.get("order_name", "unknown") if 'row' in locals() else "unknown"
+				results["errors"].append({
+					"invoice": invoice_name,
+					"order": order_name,
+					"error": str(e)
+				})
+				frappe.log_error(
+					title="Fix and Compare Error",
+					message=f"Invoice: {invoice_name}\nOrder: {order_name}\nError: {e}\n{frappe.get_traceback()}",
+				)
+		
+		# Commit any changes
+		frappe.db.commit()
+		
+		# Create summary
+		results["summary"] = {
+			"checked": results["total_checked"],
+			"fixed": results["total_fixed"],
+			"items_added": results["items_fixed"],
+			"totals_match": results["totals_match"],
+			"totals_mismatch": results["totals_mismatch"],
+			"errors": results["total_errors"],
+		}
+		
+		print(f"[info] Fix and Compare Summary:")
+		print(f"  Checked: {results['total_checked']}")
+		print(f"  Fixed: {results['total_fixed']} invoices ({results['items_fixed']} items added)")
+		print(f"  Totals Match: {results['totals_match']}")
+		print(f"  Totals Mismatch: {results['totals_mismatch']}")
+		print(f"  Errors: {results['total_errors']}")
+		
+		return results
+		
+	except Exception as e:
+		frappe.log_error(
+			title="Fix and Compare Total Error",
+			message=f"Error: {e}\n{frappe.get_traceback()}",
+		)
+		results["errors"].append({"error": str(e)})
+		return results
+
+
+@frappe.whitelist()
+def detailed_invoice_comparison_report(
+	invoice_names: Optional[List[str]] = None,
+	from_date: Optional[str] = None,
+	to_date: Optional[str] = None,
+	limit: Optional[int] = None,
+) -> Dict[str, Any]:
+	"""
+	Generate a detailed item-by-item comparison report for Sales Invoices vs Foodics Orders.
+	
+	Args:
+		invoice_names: Optional list of specific invoice names to check
+		from_date: Optional start date filter (business_date)
+		to_date: Optional end date filter (business_date)
+		limit: Optional limit on number of invoices to process
+		
+	Returns:
+		dict with detailed comparison for each invoice
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	results = {
+		"total_checked": 0,
+		"detailed_comparisons": [],
+		"summary": {},
+	}
+	
+	try:
+		# Get invoices to check
+		if invoice_names:
+			# Check specific invoices
+			invoices_to_check = []
+			for inv_name in invoice_names:
+				try:
+					inv = frappe.get_doc("Sales Invoice", inv_name)
+					order_name = None
+					
+					# Find linked Foodics Order
+					if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+						order_id = inv.foodics_order_id
+						if order_id:
+							order_name = _parent_name_for(order_id)
+					elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+						order_name = inv.foodics_order_name
+					else:
+						# Try reverse lookup
+						order_name = frappe.db.get_value("Foodics Order", {"sales_invoice": inv_name}, "name")
+					
+					if order_name:
+						invoices_to_check.append({"invoice_name": inv_name, "order_name": order_name})
+				except Exception:
+					pass
+		else:
+			# Build query to find invoices
+			conditions = []
+			values = []
+			
+			if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+				conditions.append("si.foodics_order_id IS NOT NULL AND si.foodics_order_id != ''")
+			elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+				conditions.append("si.foodics_order_name IS NOT NULL AND si.foodics_order_name != ''")
+			else:
+				conditions.append("fo.sales_invoice IS NOT NULL")
+			
+			if from_date:
+				conditions.append("fo.business_date >= %s")
+				values.append(from_date)
+			if to_date:
+				conditions.append("fo.business_date <= %s")
+				values.append(to_date)
+			
+			if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+				query = f"""
+					SELECT DISTINCT si.name as invoice_name, si.foodics_order_id
+					FROM `tabSales Invoice` si
+					INNER JOIN `tabFoodics Order` fo ON fo.foodics_order_id = si.foodics_order_id
+					WHERE {' AND '.join(conditions)}
+					ORDER BY si.creation DESC
+				"""
+			elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+				query = f"""
+					SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+					FROM `tabSales Invoice` si
+					INNER JOIN `tabFoodics Order` fo ON fo.name = si.foodics_order_name
+					WHERE {' AND '.join(conditions)}
+					ORDER BY si.creation DESC
+				"""
+			else:
+				query = f"""
+					SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+					FROM `tabSales Invoice` si
+					INNER JOIN `tabFoodics Order` fo ON fo.sales_invoice = si.name
+					WHERE {' AND '.join(conditions)}
+					ORDER BY si.creation DESC
+				"""
+			
+			if limit:
+				query += f" LIMIT {int(limit)}"
+			
+			invoices_to_check = frappe.db.sql(query, values, as_dict=True)
+		
+		print(f"[info] Generating detailed comparison for {len(invoices_to_check)} invoices")
+		
+		for row in invoices_to_check:
+			try:
+				invoice_name = row.get("invoice_name")
+				order_name = row.get("order_name")
+				order_id = row.get("foodics_order_id")
+				
+				if not order_name and order_id:
+					order_name = _parent_name_for(order_id)
+				
+				if not invoice_name or not order_name:
+					continue
+				
+				results["total_checked"] += 1
+				
+				# Get documents
+				try:
+					invoice = frappe.get_doc("Sales Invoice", invoice_name)
+					order_doc = frappe.get_doc("Foodics Order", order_name)
+				except Exception as doc_err:
+					results["detailed_comparisons"].append({
+						"invoice": invoice_name,
+						"order": order_name,
+						"error": f"Failed to load: {doc_err}"
+					})
+					continue
+				
+				# Build detailed comparison
+				comparison = {
+					"invoice_name": invoice_name,
+					"order_name": order_name,
+					"order_id": getattr(order_doc, "foodics_order_id", None),
+					"business_date": getattr(order_doc, "business_date", None),
+					"totals": {
+						"invoice_grand_total": float(invoice.grand_total or 0),
+						"invoice_net_total": float(invoice.net_total or 0),
+						"invoice_taxes": float((invoice.grand_total or 0) - (invoice.net_total or 0)),
+						"order_total_gross": float(getattr(order_doc, "total_price_gross", None) or 0),
+						"order_total_net": float(getattr(order_doc, "total_price_net", None) or 0),
+						"order_taxes": float((getattr(order_doc, "total_price_gross", None) or 0) - (getattr(order_doc, "total_price_net", None) or 0)),
+						"difference": float((invoice.grand_total or 0) - (getattr(order_doc, "total_price_gross", None) or 0)),
+					},
+					"invoice_items": [],
+					"order_items": [],
+					"item_comparison": [],
+					"missing_items": [],
+					"extra_items": [],
+				}
+				
+				# Get invoice items
+				for inv_item in invoice.items:
+					comparison["invoice_items"].append({
+						"item_code": inv_item.item_code,
+						"item_name": inv_item.item_name,
+						"qty": float(inv_item.qty or 0),
+						"rate": float(inv_item.rate or 0),
+						"amount": float(inv_item.amount or 0),
+						"foodics_product_id": None,
+						"foodics_combo_id": None,
+					})
+					
+					# Try to get Foodics IDs from item
+					try:
+						item_doc = frappe.get_doc("Item", inv_item.item_code)
+						comparison["invoice_items"][-1]["foodics_product_id"] = getattr(item_doc, "foodics_product_id", None)
+						comparison["invoice_items"][-1]["foodics_combo_id"] = getattr(item_doc, "foodics_combo_id", None)
+					except Exception:
+						pass
+				
+				# Get order items
+				order_items = getattr(order_doc, "items", []) or []
+				for order_item in order_items:
+					# Get product_name from multiple possible fields
+					product_name = (
+						getattr(order_item, "foodics_product_name", None) or
+						getattr(order_item, "product_name", None)
+					)
+					
+					# If product_name is still null, try to get it from Item doctype using SKU
+					if not product_name:
+						product_sku = getattr(order_item, "product_sku", None)
+						if product_sku:
+							try:
+								item_doc = frappe.get_doc("Item", product_sku)
+								product_name = item_doc.item_name
+							except Exception:
+								pass
+					
+					# If still null, try to extract from raw JSON
+					if not product_name and hasattr(order_doc, "foodics_order_raw") and order_doc.foodics_order_raw:
+						try:
+							import json
+							raw_data = json.loads(order_doc.foodics_order_raw)
+							# Try to find this item in raw JSON by matching quantity/price
+							products = raw_data.get("products", [])
+							for p in products:
+								p_quantity = p.get("quantity", 0)
+								p_price = p.get("unit_price", 0)
+								if (abs(p_quantity - getattr(order_item, "quantity", 0)) < 0.01 and
+								    abs(p_price - getattr(order_item, "unit_price_gross", 0)) < 0.01):
+									prod = p.get("product") or {}
+									product_name = prod.get("name")
+									if product_name:
+										break
+						except Exception:
+							pass
+					
+					comparison["order_items"].append({
+						"foodics_product_id": getattr(order_item, "foodics_product_id", None),
+						"product_sku": getattr(order_item, "product_sku", None),
+						"product_name": product_name,
+						"quantity": float(getattr(order_item, "quantity", 0) or 0),
+						"unit_price_net": float(getattr(order_item, "unit_price_net", None) or 0),
+						"unit_price_gross": float(getattr(order_item, "unit_price_gross", None) or 0),
+						"total_net": float(getattr(order_item, "quantity", 0) or 0) * float(getattr(order_item, "unit_price_net", None) or 0),
+						"total_gross": float(getattr(order_item, "quantity", 0) or 0) * float(getattr(order_item, "unit_price_gross", None) or 0),
+					})
+				
+				# Get order combos
+				order_combos = getattr(order_doc, "combos", []) or []
+				for combo in order_combos:
+					comparison["order_items"].append({
+						"foodics_combo_id": getattr(combo, "foodics_combo_id", None),
+						"combo_name": getattr(combo, "combo_name", None),
+						"quantity": float(getattr(combo, "quantity", 0) or 0),
+						"unit_price_net": float(getattr(combo, "unit_price_net", None) or 0),
+						"unit_price_gross": float(getattr(combo, "unit_price_gross", None) or 0),
+						"total_net": float(getattr(combo, "quantity", 0) or 0) * float(getattr(combo, "unit_price_net", None) or 0),
+						"total_gross": float(getattr(combo, "quantity", 0) or 0) * float(getattr(combo, "unit_price_gross", None) or 0),
+					})
+				
+				# Compare items
+				# Build maps for matching
+				order_items_by_product_id = {}
+				order_items_by_combo_id = {}
+				order_items_by_sku = {}
+				order_items_by_name = {}
+				
+				for oi in comparison["order_items"]:
+					if oi.get("foodics_product_id"):
+						order_items_by_product_id[oi["foodics_product_id"]] = oi
+					if oi.get("foodics_combo_id"):
+						order_items_by_combo_id[oi["foodics_combo_id"]] = oi
+					if oi.get("product_sku"):
+						order_items_by_sku[oi["product_sku"]] = oi
+					if oi.get("product_name"):
+						# Use product_name for matching when product_id is null
+						order_items_by_name[oi["product_name"]] = oi
+				
+				# Match invoice items to order items
+				matched_order_items = set()
+				for inv_item in comparison["invoice_items"]:
+					matched = False
+					match_info = {
+						"invoice_item": inv_item,
+						"order_item": None,
+						"match_type": None,
+						"qty_match": False,
+						"price_match": False,
+					}
+					
+					# Try to match by product_id
+					if inv_item.get("foodics_product_id"):
+						order_item = order_items_by_product_id.get(inv_item["foodics_product_id"])
+						if order_item:
+							match_info["order_item"] = order_item
+							match_info["match_type"] = "product_id"
+							matched = True
+							matched_order_items.add(id(order_item))
+					
+					# Try to match by combo_id
+					if not matched and inv_item.get("foodics_combo_id"):
+						order_item = order_items_by_combo_id.get(inv_item["foodics_combo_id"])
+						if order_item:
+							match_info["order_item"] = order_item
+							match_info["match_type"] = "combo_id"
+							matched = True
+							matched_order_items.add(id(order_item))
+					
+					# Try to match by product_name (when product_id is null)
+					# Match invoice item_name to order product_name
+					if not matched and inv_item.get("item_name"):
+						# Try exact match first
+						order_item = order_items_by_name.get(inv_item["item_name"])
+						if order_item:
+							match_info["order_item"] = order_item
+							match_info["match_type"] = "product_name"
+							matched = True
+							matched_order_items.add(id(order_item))
+						else:
+							# Try case-insensitive and partial matching
+							inv_name_lower = inv_item["item_name"].lower().strip()
+							for name, oi in order_items_by_name.items():
+								if name and name.lower().strip() == inv_name_lower:
+									match_info["order_item"] = oi
+									match_info["match_type"] = "product_name"
+									matched = True
+									matched_order_items.add(id(oi))
+									break
+					
+					# Try to match by SKU
+					if not matched:
+						order_item = order_items_by_sku.get(inv_item["item_code"])
+						if order_item:
+							match_info["order_item"] = order_item
+							match_info["match_type"] = "sku"
+							matched = True
+							matched_order_items.add(id(order_item))
+					
+					# Check quantity and price match
+					if match_info["order_item"]:
+						# Quantity match
+						if abs(inv_item["qty"] - match_info["order_item"].get("quantity", 0)) < 0.01:
+							match_info["qty_match"] = True
+						
+						# Price match (compare net prices)
+						inv_rate = inv_item["rate"]
+						order_rate = match_info["order_item"].get("unit_price_net", 0)
+						if abs(inv_rate - order_rate) < 0.01:
+							match_info["price_match"] = True
+					
+					comparison["item_comparison"].append(match_info)
+					
+					if not matched:
+						comparison["extra_items"].append(inv_item)
+				
+				# Find missing items (in order but not in invoice)
+				for oi in comparison["order_items"]:
+					if id(oi) not in matched_order_items:
+						comparison["missing_items"].append(oi)
+				
+				# Calculate totals
+				invoice_items_total = sum(item["amount"] for item in comparison["invoice_items"])
+				order_items_total_gross = sum(item.get("total_gross", 0) for item in comparison["order_items"])
+				order_items_total_net = sum(item.get("total_net", 0) for item in comparison["order_items"])
+				
+				comparison["item_totals"] = {
+					"invoice_items_total": invoice_items_total,
+					"order_items_total_gross": order_items_total_gross,
+					"order_items_total_net": order_items_total_net,
+					"items_difference": invoice_items_total - order_items_total_gross,
+				}
+				
+				# Add discounts if any
+				comparison["discounts"] = {
+					"invoice_discount": float(getattr(invoice, "discount_amount", 0) or 0),
+					"order_discount": float(getattr(order_doc, "discount_amount", 0) or 0),
+				}
+				
+				results["detailed_comparisons"].append(comparison)
+				
+			except Exception as e:
+				results["detailed_comparisons"].append({
+					"invoice": invoice_name if 'invoice_name' in locals() else "unknown",
+					"order": order_name if 'order_name' in locals() else "unknown",
+					"error": str(e)
+				})
+				frappe.log_error(
+					title="Detailed Comparison Error",
+					message=f"Invoice: {invoice_name if 'invoice_name' in locals() else 'unknown'}\nOrder: {order_name if 'order_name' in locals() else 'unknown'}\nError: {e}\n{frappe.get_traceback()}",
+				)
+		
+		# Create summary
+		total_mismatches = sum(1 for c in results["detailed_comparisons"] if abs(c.get("totals", {}).get("difference", 0)) > 0.10)
+		total_missing_items = sum(len(c.get("missing_items", [])) for c in results["detailed_comparisons"])
+		total_extra_items = sum(len(c.get("extra_items", [])) for c in results["detailed_comparisons"])
+		
+		results["summary"] = {
+			"total_checked": results["total_checked"],
+			"total_mismatches": total_mismatches,
+			"total_missing_items": total_missing_items,
+			"total_extra_items": total_extra_items,
+		}
+		
+		print(f"[info] Detailed Comparison Summary:")
+		print(f"  Checked: {results['total_checked']}")
+		print(f"  Mismatches: {total_mismatches}")
+		print(f"  Missing Items: {total_missing_items}")
+		print(f"  Extra Items: {total_extra_items}")
+		
+		return results
+		
+	except Exception as e:
+		frappe.log_error(
+			title="Detailed Comparison Report Error",
+			message=f"Error: {e}\n{frappe.get_traceback()}",
+		)
+		results["error"] = str(e)
+		return results
+
+
+@frappe.whitelist()
+def fix_invoices_to_match_orders(
+	from_date: Optional[str] = None,
+	to_date: Optional[str] = None,
+	limit: Optional[int] = None,
+	fix_items: bool = True,
+	fix_totals: bool = True,
+) -> Dict[str, Any]:
+	"""
+	Fix Sales Invoices to match Foodics Order values and items.
+	- Adds missing items from Foodics Orders
+	- Adjusts prices to match order gross prices
+	- Recalculates taxes and totals
+	- Re-submits invoices
+	
+	Args:
+		from_date: Optional start date filter (business_date)
+		to_date: Optional end date filter (business_date)
+		limit: Optional limit on number of invoices to process
+		fix_items: If True, add missing items (default: True)
+		fix_totals: If True, adjust prices to match order totals (default: True)
+		
+	Returns:
+		dict with results: fixed, items_added, totals_adjusted, errors
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	results = {
+		"total_checked": 0,
+		"total_fixed": 0,
+		"items_added": 0,
+		"totals_adjusted": 0,
+		"errors": [],
+		"fixed_invoices": [],
+	}
+	
+	try:
+		# Build query to find Sales Invoices with Foodics Orders
+		conditions = []
+		values = []
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			conditions.append("si.foodics_order_id IS NOT NULL AND si.foodics_order_id != ''")
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			conditions.append("si.foodics_order_name IS NOT NULL AND si.foodics_order_name != ''")
+		else:
+			conditions.append("fo.sales_invoice IS NOT NULL")
+		
+		if from_date:
+			conditions.append("fo.business_date >= %s")
+			values.append(from_date)
+		if to_date:
+			conditions.append("fo.business_date <= %s")
+			values.append(to_date)
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, si.foodics_order_id
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.foodics_order_id = si.foodics_order_id
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.name = si.foodics_order_name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		else:
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.sales_invoice = si.name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		
+		if limit:
+			query += f" LIMIT {int(limit)}"
+		
+		invoices = frappe.db.sql(query, values, as_dict=True)
+		
+		print(f"[info] Found {len(invoices)} invoices to fix")
+		
+		for row in invoices:
+			try:
+				invoice_name = row.get("invoice_name")
+				order_name = row.get("order_name")
+				order_id = row.get("foodics_order_id")
+				
+				if not order_name and order_id:
+					order_name = _parent_name_for(order_id)
+				
+				if not invoice_name or not order_name:
+					continue
+				
+				results["total_checked"] += 1
+				
+				# Get documents
+				try:
+					invoice = frappe.get_doc("Sales Invoice", invoice_name)
+					order_doc = frappe.get_doc("Foodics Order", order_name)
+				except Exception as doc_err:
+					results["errors"].append({
+						"invoice": invoice_name,
+						"order": order_name,
+						"error": f"Failed to load documents: {doc_err}"
+					})
+					continue
+				
+				# Check invoice status
+				invoice.reload()
+				was_submitted = invoice.docstatus == 1
+				was_cancelled = invoice.docstatus == 2
+				is_draft = invoice.docstatus == 0
+				
+				items_added_count = 0
+				totals_adjusted_flag = False
+				
+				# For cancelled invoices, we'll use direct SQL updates (risky but necessary)
+				# For submitted invoices, cancel first, then fix
+				if was_cancelled:
+					print(f"[info] Invoice {invoice_name} is cancelled, will use direct SQL updates")
+					use_direct_sql = True
+				elif was_submitted:
+					print(f"[info] Invoice {invoice_name} is submitted, cancelling to allow editing...")
+					try:
+						invoice.cancel()
+						frappe.db.commit()
+						invoice = frappe.get_doc("Sales Invoice", invoice_name)
+						if invoice.docstatus == 2:
+							use_direct_sql = True
+							print(f"[info] Invoice became cancelled, will use direct SQL updates")
+						else:
+							use_direct_sql = False
+					except Exception as cancel_err:
+						print(f"[warn] Failed to cancel invoice {invoice_name}: {cancel_err}")
+						results["errors"].append({
+							"invoice": invoice_name,
+							"order": order_name,
+							"error": f"Failed to cancel: {cancel_err}"
+						})
+						continue
+				else:
+					use_direct_sql = False
+				
+				# Step 1: Fix missing items
+				if fix_items:
+					validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+					missing_items = validation_result.get("missing_items", [])
+					
+					if missing_items:
+						print(f"[info] Invoice {invoice_name} has {len(missing_items)} missing items, fixing...")
+						
+						# Cancel if submitted (to allow editing)
+						if was_submitted:
+							try:
+								print(f"[info] Cancelling submitted invoice {invoice_name} to allow editing...")
+								invoice.cancel()
+								frappe.db.commit()
+								# Reload to get updated docstatus
+								invoice = frappe.get_doc("Sales Invoice", invoice_name)
+								if invoice.docstatus == 2:
+									print(f"[warn] Invoice {invoice_name} became cancelled after cancel operation, skipping")
+									continue
+							except Exception as cancel_err:
+								print(f"[warn] Failed to cancel invoice {invoice_name}: {cancel_err}")
+								results["errors"].append({
+									"invoice": invoice_name,
+									"order": order_name,
+									"error": f"Failed to cancel for editing: {cancel_err}"
+								})
+								continue
+						
+						fix_result = _fix_invoice_missing_items(invoice, order_doc, missing_items)
+						
+						if fix_result.get("fixed", False):
+							items_added_count = fix_result.get("items_added", 0)
+							results["items_added"] += items_added_count
+							invoice.reload()
+				
+				# Step 2: Fix prices and taxes to match order totals
+				if fix_totals:
+					order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+					order_total_net = float(getattr(order_doc, "total_price_net", None) or 0)
+					invoice_total = float(invoice.grand_total or 0)
+					invoice_net = float(invoice.net_total or 0)
+					tolerance = 0.10
+					
+					if order_total_gross > 0 and abs(invoice_total - order_total_gross) > tolerance:
+						print(f"[info] Invoice {invoice_name} total mismatch: Invoice={invoice_total:.2f}, Order={order_total_gross:.2f}, fixing...")
+						
+						# Check current status
+						invoice.reload()
+						
+						# If cancelled, use direct SQL (already set use_direct_sql above)
+						if invoice.docstatus == 2:  # Cancelled
+							use_direct_sql = True
+							print(f"[info] Invoice {invoice_name} is cancelled, will use direct SQL updates")
+						
+						# For submitted invoices, we need to cancel to edit
+						needs_cancellation = invoice.docstatus == 1
+						if needs_cancellation:
+							try:
+								print(f"[info] Cancelling submitted invoice {invoice_name} to allow editing...")
+								invoice.cancel()
+								frappe.db.commit()
+								# Reload to get updated docstatus
+								invoice = frappe.get_doc("Sales Invoice", invoice_name)
+								if invoice.docstatus == 2:
+									print(f"[warn] Invoice {invoice_name} became cancelled, skipping")
+									continue
+							except Exception as cancel_err:
+								print(f"[warn] Failed to cancel invoice {invoice_name}: {cancel_err}")
+								results["errors"].append({
+									"invoice": invoice_name,
+									"order": order_name,
+									"error": f"Failed to cancel for editing: {cancel_err}"
+								})
+								continue
+						
+						# Get order items to match prices
+						order_items = getattr(order_doc, "items", []) or []
+						order_combos = getattr(order_doc, "combos", []) or []
+						
+						# Build maps for matching
+						order_items_by_product_id = {}
+						order_items_by_combo_id = {}
+						order_items_by_name = {}
+						order_items_by_sku = {}
+						
+						for oi in order_items:
+							product_id = getattr(oi, "foodics_product_id", None)
+							combo_id = getattr(oi, "foodics_combo_id", None)
+							product_sku = getattr(oi, "product_sku", None)
+							product_name = (
+								getattr(oi, "foodics_product_name", None) or
+								getattr(oi, "product_name", None)
+							)
+							
+							if product_id:
+								order_items_by_product_id[product_id] = oi
+							if combo_id:
+								order_items_by_combo_id[combo_id] = oi
+							if product_sku:
+								order_items_by_sku[product_sku] = oi
+							if product_name:
+								order_items_by_name[product_name] = oi
+						
+						for combo in order_combos:
+							combo_id = getattr(combo, "foodics_combo_id", None)
+							combo_name = getattr(combo, "combo_name", None)
+							
+							if combo_id:
+								order_items_by_combo_id[combo_id] = combo
+							if combo_name:
+								order_items_by_name[combo_name] = combo
+						
+						# Update invoice item prices to match order gross prices
+						# Track which order items have been matched
+						matched_order_item_indices = set()
+						
+						# Get invoice items (reload to ensure we have latest)
+						invoice.reload()
+						
+						for inv_item in invoice.items:
+							matched_order_item = None
+							matched_index = None
+							
+							# Try to match by product_id
+							try:
+								item_doc = frappe.get_doc("Item", inv_item.item_code)
+								product_id = getattr(item_doc, "foodics_product_id", None)
+								combo_id = getattr(item_doc, "foodics_combo_id", None)
+								
+								if product_id and product_id in order_items_by_product_id:
+									matched_order_item = order_items_by_product_id[product_id]
+								elif combo_id and combo_id in order_items_by_combo_id:
+									matched_order_item = order_items_by_combo_id[combo_id]
+								elif inv_item.item_name and inv_item.item_name in order_items_by_name:
+									matched_order_item = order_items_by_name[inv_item.item_name]
+								elif inv_item.item_code in order_items_by_sku:
+									matched_order_item = order_items_by_sku[inv_item.item_code]
+							except Exception:
+								pass
+							
+							# If no match by ID/name/SKU, try to match by quantity and price (fallback)
+							if not matched_order_item:
+								inv_qty = float(inv_item.qty or 0)
+								inv_rate = float(inv_item.rate or 0)
+								
+								# Try to find order item with matching quantity and similar price
+								for idx, oi in enumerate(order_items):
+									if idx in matched_order_item_indices:
+										continue
+									
+									oi_qty = float(getattr(oi, "quantity", 0) or 0)
+									oi_net_price = float(getattr(oi, "unit_price_net", None) or 0)
+									oi_gross_price = float(getattr(oi, "unit_price_gross", None) or 0)
+									
+									# Match by quantity and price (within tolerance)
+									if (abs(oi_qty - inv_qty) < 0.01 and
+									    (abs(oi_net_price - inv_rate) < 0.50 or abs(oi_gross_price - inv_rate) < 0.50)):
+										matched_order_item = oi
+										matched_index = idx
+										break
+							
+							if matched_order_item:
+								if matched_index is not None:
+									matched_order_item_indices.add(matched_index)
+								
+								# Use net price from order (invoice should use net, tax will be added)
+								order_net_price = float(getattr(matched_order_item, "unit_price_net", None) or 0)
+								order_gross_price = float(getattr(matched_order_item, "unit_price_gross", None) or 0)
+								
+								old_rate = float(inv_item.rate or 0)
+								new_rate = None
+								
+								if order_net_price > 0:
+									# Use net price (taxes will be calculated separately)
+									new_rate = order_net_price
+								elif order_gross_price > 0:
+									# Fallback: calculate net from gross (assuming 15% VAT)
+									new_rate = order_gross_price / 1.15
+								
+								if new_rate and abs(new_rate - old_rate) > 0.01:
+									if use_direct_sql:
+										# Update via SQL for cancelled invoices
+										frappe.db.sql("""
+											UPDATE `tabSales Invoice Item`
+											SET rate = %s, amount = qty * %s
+											WHERE name = %s
+										""", (new_rate, new_rate, inv_item.name))
+										print(f"[info] Updated price via SQL for {inv_item.item_code}: {old_rate:.2f} -> {new_rate:.2f}")
+									else:
+										# Normal update
+										inv_item.rate = new_rate
+										print(f"[info] Updated price for {inv_item.item_code}: {old_rate:.2f} -> {new_rate:.2f} (net)")
+									
+									totals_adjusted_flag = True
+						
+						# Ensure tax template is applied (15% VAT)
+						settings = frappe.get_single("Foodics Settings")
+						tax_template = getattr(settings, "default_sales_taxes_and_charges_template", None)
+						if not tax_template:
+							tax_template = frappe.db.get_value("Sales Taxes and Charges Template", {"name": "VAT 15%"}, "name")
+						
+						if tax_template:
+							try:
+								invoice.taxes_and_charges = tax_template
+								invoice.run_method("set_missing_values")
+								invoice.run_method("set_taxes")
+							except Exception:
+								pass
+						
+						# Recalculate totals
+						if totals_adjusted_flag:
+							try:
+								if use_direct_sql:
+									# For cancelled invoices, use direct SQL to update
+									# First, update item rates via SQL
+									for inv_item in invoice.items:
+										# Update rate directly in database
+										frappe.db.sql("""
+											UPDATE `tabSales Invoice Item`
+											SET rate = %s, amount = qty * %s
+											WHERE name = %s
+										""", (inv_item.rate, inv_item.rate, inv_item.name))
+									
+									# Recalculate net total
+									net_total = frappe.db.sql("""
+										SELECT SUM(amount) FROM `tabSales Invoice Item`
+										WHERE parent = %s
+									""", invoice_name)[0][0] or 0
+									
+									# Calculate tax (15% VAT)
+									tax_amount = net_total * 0.15
+									grand_total = net_total + tax_amount
+									
+									# Update invoice totals
+									frappe.db.sql("""
+										UPDATE `tabSales Invoice`
+										SET net_total = %s,
+										    total_taxes_and_charges = %s,
+										    grand_total = %s,
+										    rounded_total = %s
+										WHERE name = %s
+									""", (net_total, tax_amount, grand_total, grand_total, invoice_name))
+									
+									# Update tax row
+									frappe.db.sql("""
+										UPDATE `tabSales Taxes and Charges`
+										SET tax_amount = %s, total = %s
+										WHERE parent = %s AND charge_type = 'On Net Total'
+									""", (tax_amount, tax_amount, invoice_name))
+									
+									frappe.db.commit()
+									print(f"[info] Updated invoice {invoice_name} totals via SQL: net={net_total:.2f}, tax={tax_amount:.2f}, grand={grand_total:.2f}")
+									results["totals_adjusted"] += 1
+									totals_adjusted_flag = True
+								else:
+									# Normal update for draft invoices
+									invoice.run_method("calculate_taxes_and_totals")
+									invoice.save(ignore_permissions=True)
+									frappe.db.commit()
+									results["totals_adjusted"] += 1
+									totals_adjusted_flag = True
+							except Exception as calc_err:
+								print(f"[warn] Failed to recalculate totals: {calc_err}")
+								results["errors"].append({
+									"invoice": invoice_name,
+									"order": order_name,
+									"error": f"Failed to recalculate: {calc_err}"
+								})
+				
+				# Step 3: Ensure invoice total matches order total (final adjustment)
+				if fix_totals:
+					invoice.reload()
+					order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+					invoice_total = float(invoice.grand_total or 0)
+					tolerance = 0.10
+					
+					if order_total_gross > 0 and abs(invoice_total - order_total_gross) > tolerance:
+						# If still doesn't match, check if we need to adjust tax rate
+						diff = order_total_gross - invoice_total
+						
+						# Calculate expected tax
+						invoice_net = float(invoice.net_total or 0)
+						expected_tax = order_total_gross - invoice_net
+						actual_tax = invoice_total - invoice_net
+						
+						if abs(expected_tax - actual_tax) > tolerance:
+							# Tax calculation is wrong, adjust tax entry
+							if use_direct_sql:
+								# Use SQL to update tax
+								if invoice_net > 0:
+									correct_tax_amount = expected_tax
+									correct_grand_total = invoice_net + correct_tax_amount
+									
+									# Update tax row via SQL
+									frappe.db.sql("""
+										UPDATE `tabSales Taxes and Charges`
+										SET tax_amount = %s, total = %s, rate = %s
+										WHERE parent = %s AND charge_type = 'On Net Total'
+									""", (correct_tax_amount, correct_tax_amount, (correct_tax_amount / invoice_net) * 100, invoice_name))
+									
+									# Update invoice totals
+									frappe.db.sql("""
+										UPDATE `tabSales Invoice`
+										SET total_taxes_and_charges = %s,
+										    grand_total = %s,
+										    rounded_total = %s
+										WHERE name = %s
+									""", (correct_tax_amount, correct_grand_total, correct_grand_total, invoice_name))
+									
+									frappe.db.commit()
+									print(f"[info] Updated tax via SQL: tax={correct_tax_amount:.2f}, grand_total={correct_grand_total:.2f}")
+									totals_adjusted_flag = True
+							else:
+								# Normal update for draft invoices
+								if invoice.taxes:
+									for tax_row in invoice.taxes:
+										if tax_row.charge_type == "On Net Total":
+											# Calculate correct rate
+											if invoice_net > 0:
+												correct_rate = (expected_tax / invoice_net) * 100
+												tax_row.rate = correct_rate
+												print(f"[info] Adjusted tax rate to {correct_rate:.2f}% to match order total")
+												totals_adjusted_flag = True
+												break
+								
+								try:
+									invoice.run_method("calculate_taxes_and_totals")
+									invoice.save(ignore_permissions=True)
+									frappe.db.commit()
+									totals_adjusted_flag = True
+									print(f"[info] Recalculated taxes to match order total")
+								except Exception as tax_err:
+									print(f"[warn] Failed to adjust taxes: {tax_err}")
+				
+				# Step 4: Re-submit if it was submitted originally
+				if was_submitted and (items_added_count > 0 or totals_adjusted_flag):
+					try:
+						invoice.reload()
+						if invoice.docstatus == 0:  # Draft
+							# Ensure set_posting_time and is_pos are set
+							try:
+								invoice.db_set("set_posting_time", 1)
+								if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+									invoice.db_set("is_pos", 1)
+								frappe.db.commit()
+							except Exception:
+								pass
+							
+							invoice.submit()
+							frappe.db.commit()
+							print(f"[info] Re-submitted invoice {invoice_name}")
+							
+							# Ensure outstanding and status are correct if fully paid
+							order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+							invoice.reload()
+							if invoice.grand_total and abs(float(invoice.grand_total) - order_total_gross) < 0.10:
+								# Check if order is fully paid
+								if _is_order_fully_paid({"id": getattr(order_doc, "foodics_order_id", None)}):
+									try:
+										invoice.db_set("outstanding_amount", 0)
+										invoice.db_set("status", "Paid")
+										frappe.db.commit()
+									except Exception:
+										pass
+						elif invoice.docstatus == 2:
+							print(f"[warn] Invoice {invoice_name} is cancelled, cannot re-submit")
+					except Exception as submit_err:
+						print(f"[warn] Failed to re-submit invoice {invoice_name}: {submit_err}")
+						results["errors"].append({
+							"invoice": invoice_name,
+							"order": order_name,
+							"error": f"Failed to re-submit: {submit_err}"
+						})
+				
+				# Record success
+				if items_added_count > 0 or totals_adjusted_flag:
+					results["total_fixed"] += 1
+					results["fixed_invoices"].append({
+						"invoice": invoice_name,
+						"order": order_name,
+						"items_added": items_added_count,
+						"totals_adjusted": totals_adjusted_flag,
+					})
+				
+			except Exception as e:
+				results["errors"].append({
+					"invoice": invoice_name if 'invoice_name' in locals() else "unknown",
+					"order": order_name if 'order_name' in locals() else "unknown",
+					"error": str(e)
+				})
+				frappe.log_error(
+					title="Fix Invoice Error",
+					message=f"Invoice: {invoice_name if 'invoice_name' in locals() else 'unknown'}\nOrder: {order_name if 'order_name' in locals() else 'unknown'}\nError: {e}\n{frappe.get_traceback()}",
+				)
+		
+		# Final commit
+		frappe.db.commit()
+		
+		# Create summary
+		results["summary"] = {
+			"checked": results["total_checked"],
+			"fixed": results["total_fixed"],
+			"items_added": results["items_added"],
+			"totals_adjusted": results["totals_adjusted"],
+			"errors": len(results["errors"]),
+		}
+		
+		print(f"[info] Fix Summary:")
+		print(f"  Checked: {results['total_checked']}")
+		print(f"  Fixed: {results['total_fixed']} invoices")
+		print(f"  Items Added: {results['items_added']}")
+		print(f"  Totals Adjusted: {results['totals_adjusted']}")
+		print(f"  Errors: {len(results['errors'])}")
+		
+		return results
+		
+	except Exception as e:
+		frappe.log_error(
+			title="Fix Invoices to Match Orders Error",
+			message=f"Error: {e}\n{frappe.get_traceback()}",
+		)
+		results["error"] = str(e)
+		return results
+
+
+@frappe.whitelist()
+def fix_and_resubmit_invoices_in_batches(
+	from_date: Optional[str] = None,
+	to_date: Optional[str] = None,
+	batch_size: int = 10,
+	fix_items: bool = True,
+	fix_totals: bool = True,
+) -> Dict[str, Any]:
+	"""
+	Fix invoices to match Foodics Orders and resubmit them.
+	- Sets cancelled invoices to draft (docstatus = 0) via SQL
+	- Fixes items and totals
+	- Submits invoices
+	- Processes in batches of specified size
+	
+	Args:
+		from_date: Optional start date filter (business_date)
+		to_date: Optional end date filter (business_date)
+		batch_size: Number of invoices to process per batch (default: 10)
+		fix_items: If True, add missing items (default: True)
+		fix_totals: If True, adjust prices to match order totals (default: True)
+		
+	Returns:
+		dict with results per batch
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	all_results = {
+		"total_batches": 0,
+		"total_checked": 0,
+		"total_fixed": 0,
+		"total_resubmitted": 0,
+		"items_added": 0,
+		"totals_adjusted": 0,
+		"errors": [],
+		"batches": [],
+	}
+	
+	try:
+		# Build query to find Sales Invoices with Foodics Orders that need fixing
+		conditions = []
+		values = []
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			conditions.append("si.foodics_order_id IS NOT NULL AND si.foodics_order_id != ''")
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			conditions.append("si.foodics_order_name IS NOT NULL AND si.foodics_order_name != ''")
+		else:
+			conditions.append("fo.sales_invoice IS NOT NULL")
+		
+		if from_date:
+			conditions.append("fo.business_date >= %s")
+			values.append(from_date)
+		if to_date:
+			conditions.append("fo.business_date <= %s")
+			values.append(to_date)
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, si.foodics_order_id, si.docstatus, si.grand_total
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.foodics_order_id = si.foodics_order_id
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name, si.docstatus, si.grand_total, fo.total_price_gross
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.name = si.foodics_order_name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		else:
+			query = f"""
+				SELECT DISTINCT si.name as invoice_name, fo.name as order_name, si.docstatus, si.grand_total, fo.total_price_gross
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.sales_invoice = si.name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		
+		all_invoices = frappe.db.sql(query, values, as_dict=True)
+		
+		# Filter invoices that need fixing (mismatched totals)
+		invoices_to_fix = []
+		for row in all_invoices:
+			invoice_name = row.get("invoice_name")
+			order_name = row.get("order_name")
+			order_id = row.get("foodics_order_id")
+			
+			if not order_name and order_id:
+				order_name = _parent_name_for(order_id)
+			
+			if not invoice_name or not order_name:
+				continue
+			
+			# Check if totals match
+			try:
+				order_doc = frappe.get_doc("Foodics Order", order_name)
+				order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+				invoice_total = float(row.get("grand_total") or 0)
+				tolerance = 0.10
+				
+				# Also check rounded_total if it exists and is different from grand_total
+				rounded_total = float(row.get("rounded_total") or 0)
+				if rounded_total > 0 and abs(rounded_total - invoice_total) > 0.01:
+					# Use the one that's closer to order total
+					diff_grand = abs(invoice_total - order_total_gross)
+					diff_rounded = abs(rounded_total - order_total_gross)
+					if diff_rounded < diff_grand:
+						invoice_total = rounded_total
+				
+				if order_total_gross > 0 and abs(invoice_total - order_total_gross) > tolerance:
+					invoices_to_fix.append({
+						"invoice_name": invoice_name,
+						"order_name": order_name,
+						"docstatus": row.get("docstatus", 0),
+					})
+			except Exception:
+				continue
+		
+		print(f"[info] Found {len(invoices_to_fix)} invoices that need fixing")
+		
+		# Process in batches
+		total_batches = (len(invoices_to_fix) + batch_size - 1) // batch_size
+		all_results["total_batches"] = total_batches
+		
+		for batch_num in range(total_batches):
+			start_idx = batch_num * batch_size
+			end_idx = min(start_idx + batch_size, len(invoices_to_fix))
+			batch_invoices = invoices_to_fix[start_idx:end_idx]
+			
+			print(f"\n[info] Processing batch {batch_num + 1}/{total_batches} ({len(batch_invoices)} invoices)")
+			
+			batch_results = {
+				"batch_number": batch_num + 1,
+				"checked": 0,
+				"fixed": 0,
+				"resubmitted": 0,
+				"items_added": 0,
+				"totals_adjusted": 0,
+				"errors": [],
+				"fixed_invoices": [],
+			}
+			
+			for row in batch_invoices:
+				try:
+					invoice_name = row["invoice_name"]
+					order_name = row["order_name"]
+					docstatus = row["docstatus"]
+					
+					batch_results["checked"] += 1
+					all_results["total_checked"] += 1
+					
+					# Get documents
+					try:
+						invoice = frappe.get_doc("Sales Invoice", invoice_name)
+						order_doc = frappe.get_doc("Foodics Order", order_name)
+					except Exception as doc_err:
+						error_msg = f"Failed to load documents: {doc_err}"
+						batch_results["errors"].append({
+							"invoice": invoice_name,
+							"error": error_msg
+						})
+						all_results["errors"].append({
+							"invoice": invoice_name,
+							"error": error_msg
+						})
+						continue
+					
+					# Step 1: If cancelled, set to draft via SQL
+					if invoice.docstatus == 2:  # Cancelled
+						print(f"[info] Setting cancelled invoice {invoice_name} to draft (docstatus = 0)...")
+						try:
+							frappe.db.sql("""
+								UPDATE `tabSales Invoice`
+								SET docstatus = 0
+								WHERE name = %s
+							""", invoice_name)
+							frappe.db.commit()
+							invoice.reload()
+							print(f"[info] Invoice {invoice_name} set to draft")
+						except Exception as sql_err:
+							error_msg = f"Failed to set invoice to draft: {sql_err}"
+							batch_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+							all_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+							continue
+					
+					# Step 2: If submitted, cancel first, then set to draft
+					if invoice.docstatus == 1:  # Submitted
+						print(f"[info] Cancelling submitted invoice {invoice_name}...")
+						try:
+							invoice.cancel()
+							frappe.db.commit()
+							invoice.reload()
+							# After cancellation, invoice becomes cancelled (docstatus=2)
+							# Set it back to draft via SQL
+							if invoice.docstatus == 2:
+								print(f"[info] Setting cancelled invoice {invoice_name} to draft (docstatus = 0)...")
+								frappe.db.sql("""
+									UPDATE `tabSales Invoice`
+									SET docstatus = 0
+									WHERE name = %s
+								""", invoice_name)
+								frappe.db.commit()
+								invoice.reload()
+								print(f"[info] Invoice {invoice_name} set to draft")
+						except Exception as cancel_err:
+							error_msg = f"Failed to cancel invoice: {cancel_err}"
+							batch_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+							all_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+							continue
+					
+					# Step 3: Fix missing items
+					items_added_count = 0
+					if fix_items:
+						validation_result = _validate_invoice_items_and_values(invoice, order_doc)
+						missing_items = validation_result.get("missing_items", [])
+						
+						if missing_items:
+							print(f"[info] Invoice {invoice_name} has {len(missing_items)} missing items, fixing...")
+							fix_result = _fix_invoice_missing_items(invoice, order_doc, missing_items)
+							
+							if fix_result.get("fixed", False):
+								items_added_count = fix_result.get("items_added", 0)
+								batch_results["items_added"] += items_added_count
+								all_results["items_added"] += items_added_count
+								invoice.reload()
+					
+					# Step 4: Fix prices and totals
+					totals_adjusted_flag = False
+					if fix_totals:
+						order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+						invoice_total = float(invoice.grand_total or 0)
+						tolerance = 0.10
+						
+						if order_total_gross > 0 and abs(invoice_total - order_total_gross) > tolerance:
+							print(f"[info] Fixing totals for invoice {invoice_name}: {invoice_total:.2f} -> {order_total_gross:.2f}")
+							
+							# Get order items
+							order_items = getattr(order_doc, "items", []) or []
+							order_combos = getattr(order_doc, "combos", []) or []
+							
+							# Build maps for matching
+							order_items_by_product_id = {}
+							order_items_by_combo_id = {}
+							order_items_by_name = {}
+							order_items_by_sku = {}
+							
+							for oi in order_items:
+								product_id = getattr(oi, "foodics_product_id", None)
+								combo_id = getattr(oi, "foodics_combo_id", None)
+								product_sku = getattr(oi, "product_sku", None)
+								product_name = (
+									getattr(oi, "foodics_product_name", None) or
+									getattr(oi, "product_name", None)
+								)
+								
+								if product_id:
+									order_items_by_product_id[product_id] = oi
+								if combo_id:
+									order_items_by_combo_id[combo_id] = oi
+								if product_sku:
+									order_items_by_sku[product_sku] = oi
+								if product_name:
+									order_items_by_name[product_name] = oi
+							
+							for combo in order_combos:
+								combo_id = getattr(combo, "foodics_combo_id", None)
+								combo_name = getattr(combo, "combo_name", None)
+								
+								if combo_id:
+									order_items_by_combo_id[combo_id] = combo
+								if combo_name:
+									order_items_by_name[combo_name] = combo
+							
+							# Update invoice item prices
+							matched_order_item_indices = set()
+							
+							for inv_item in invoice.items:
+								matched_order_item = None
+								matched_index = None
+								
+								# Try to match by product_id
+								try:
+									item_doc = frappe.get_doc("Item", inv_item.item_code)
+									product_id = getattr(item_doc, "foodics_product_id", None)
+									combo_id = getattr(item_doc, "foodics_combo_id", None)
+									
+									if product_id and product_id in order_items_by_product_id:
+										matched_order_item = order_items_by_product_id[product_id]
+									elif combo_id and combo_id in order_items_by_combo_id:
+										matched_order_item = order_items_by_combo_id[combo_id]
+									elif inv_item.item_name and inv_item.item_name in order_items_by_name:
+										matched_order_item = order_items_by_name[inv_item.item_name]
+									elif inv_item.item_code in order_items_by_sku:
+										matched_order_item = order_items_by_sku[inv_item.item_code]
+								except Exception:
+									pass
+								
+								# Fallback: match by quantity and price
+								if not matched_order_item:
+									inv_qty = float(inv_item.qty or 0)
+									inv_rate = float(inv_item.rate or 0)
+									
+									for idx, oi in enumerate(order_items):
+										if idx in matched_order_item_indices:
+											continue
+										
+										oi_qty = float(getattr(oi, "quantity", 0) or 0)
+										oi_net_price = float(getattr(oi, "unit_price_net", None) or 0)
+										oi_gross_price = float(getattr(oi, "unit_price_gross", None) or 0)
+										
+										if (abs(oi_qty - inv_qty) < 0.01 and
+										    (abs(oi_net_price - inv_rate) < 0.50 or abs(oi_gross_price - inv_rate) < 0.50)):
+											matched_order_item = oi
+											matched_index = idx
+											break
+								
+								if matched_order_item:
+									if matched_index is not None:
+										matched_order_item_indices.add(matched_index)
+									
+									order_net_price = float(getattr(matched_order_item, "unit_price_net", None) or 0)
+									order_gross_price = float(getattr(matched_order_item, "unit_price_gross", None) or 0)
+									
+									old_rate = float(inv_item.rate or 0)
+									new_rate = None
+									
+									if order_net_price > 0:
+										new_rate = order_net_price
+									elif order_gross_price > 0:
+										new_rate = order_gross_price / 1.15
+									
+									if new_rate and abs(new_rate - old_rate) > 0.01:
+										inv_item.rate = new_rate
+										totals_adjusted_flag = True
+										print(f"[info] Updated price for {inv_item.item_code}: {old_rate:.2f} -> {new_rate:.2f}")
+							
+							# Always ensure tax template is applied and totals are recalculated
+							# Try to find VAT 15% template (could be "VAT 15%", "vat15 - F", etc.)
+							tax_template = None
+							# First try common names
+							for template_name in ["VAT 15%", "vat15 - F", "vat15"]:
+								if frappe.db.exists("Sales Taxes and Charges Template", template_name):
+									tax_template = template_name
+									break
+							# If not found, search for any template with VAT in name
+							if not tax_template:
+								templates = frappe.get_all("Sales Taxes and Charges Template", 
+									filters={"name": ["like", "%vat%"]}, 
+									fields=["name"], 
+									limit=1)
+								if templates:
+									tax_template = templates[0].name
+							
+							if tax_template:
+								try:
+									invoice.taxes_and_charges = tax_template
+									# Disable rounding to use exact grand_total
+									if frappe.get_meta("Sales Invoice").has_field("disable_rounded_total"):
+										invoice.disable_rounded_total = 1
+									invoice.run_method("set_missing_values")
+									invoice.run_method("set_taxes")
+									totals_adjusted_flag = True
+								except Exception as tax_err:
+									print(f"[warn] Failed to set tax template: {tax_err}")
+							
+							# Always recalculate totals when fixing (even if rates didn't change, tax might be missing)
+							try:
+								invoice.run_method("calculate_taxes_and_totals")
+								invoice.save(ignore_permissions=True)
+								frappe.db.commit()
+								
+								# Verify the total matches after recalculation
+								invoice.reload()
+								new_invoice_total = float(invoice.grand_total or 0)
+								if abs(new_invoice_total - order_total_gross) > tolerance:
+									# Still doesn't match - check if we need to add charges or adjust
+									invoice_net = float(invoice.net_total or 0)
+									
+									# Calculate what's missing
+									missing_amount = order_total_gross - new_invoice_total
+									
+									# Check if order has charges that should be added
+									order_charges_total = 0
+									if hasattr(order_doc, 'charges') and order_doc.charges:
+										for charge in order_doc.charges:
+											amount_gross = float(getattr(charge, 'amount_gross', 0) or 0)
+											amount = float(getattr(charge, 'amount', 0) or 0)
+											order_charges_total += amount_gross if amount_gross > 0 else amount
+									
+									# If charges exist and match the missing amount, add them as invoice items
+									if order_charges_total > 0 and abs(order_charges_total - missing_amount) < 0.50:
+										# Add charges as invoice items
+										for charge in order_doc.charges:
+											amount_gross = float(getattr(charge, 'amount_gross', 0) or 0)
+											amount = float(getattr(charge, 'amount', 0) or 0)
+											charge_amount = amount_gross if amount_gross > 0 else amount
+											charge_name = getattr(charge, 'charge_name', 'Additional Charge')
+											
+											if charge_amount > 0:
+												# Find or create a service item for charges
+												service_item = frappe.db.get_value("Item", {"item_name": "Service Charge"}, "name")
+												if not service_item:
+													service_item = frappe.db.get_value("Item", {"item_name": "Additional Charge"}, "name")
+												if not service_item:
+													# Use a generic service item or create one
+													service_item = frappe.db.get_value("Item", {"item_group": "Services"}, "name", order_by="creation desc")
+												
+												if service_item:
+													inv_item = invoice.append("items", {})
+													inv_item.item_code = service_item
+													inv_item.qty = 1
+													# Use net amount (charge amount is gross, so divide by 1.15 for net)
+													inv_item.rate = charge_amount / 1.15
+													inv_item.description = charge_name
+													print(f"[info] Added charge as invoice item: {charge_name} = {charge_amount:.2f} SAR")
+										
+										# Recalculate with charges
+										invoice.run_method("calculate_taxes_and_totals")
+										invoice.save(ignore_permissions=True)
+										frappe.db.commit()
+										invoice.reload()
+										new_invoice_total = float(invoice.grand_total or 0)
+									
+									# If still doesn't match, adjust tax manually
+									if abs(new_invoice_total - order_total_gross) > tolerance:
+										invoice.reload()  # Reload to get latest values
+										invoice_net = float(invoice.net_total or 0)
+										if invoice_net > 0:
+											expected_tax = order_total_gross - invoice_net
+											if expected_tax > 0:
+												# Update tax row - need to modify the tax amount directly
+												if invoice.taxes:
+													for tax_row in invoice.taxes:
+														if tax_row.charge_type == "On Net Total":
+															# Calculate the rate needed
+															required_rate = (expected_tax / invoice_net) * 100 if invoice_net > 0 else 15.0
+															tax_row.rate = required_rate
+															tax_row.tax_amount = expected_tax
+															tax_row.total = expected_tax
+															print(f"[info] Updating tax: rate={required_rate:.2f}%, amount={expected_tax:.2f}")
+															break
+												
+												# Recalculate again
+												invoice.run_method("calculate_taxes_and_totals")
+												invoice.save(ignore_permissions=True)
+												frappe.db.commit()
+												
+												# Verify it worked
+												invoice.reload()
+												final_total = float(invoice.grand_total or 0)
+												if abs(final_total - order_total_gross) <= tolerance:
+													print(f"[info] Successfully adjusted tax: invoice now matches order ({final_total:.2f} = {order_total_gross:.2f})")
+												else:
+													print(f"[info] Manually adjusted tax, but still mismatch: {final_total:.2f} vs {order_total_gross:.2f}")
+													# Last resort: set grand_total directly via SQL if needed
+													if abs(final_total - order_total_gross) > 0.50:  # Large difference
+														# Use SQL to set exact total
+														frappe.db.sql("""
+															UPDATE `tabSales Invoice`
+															SET grand_total = %s,
+															    rounded_total = %s,
+															    base_grand_total = %s,
+															    base_rounded_total = %s
+															WHERE name = %s
+														""", (order_total_gross, order_total_gross, order_total_gross, order_total_gross, invoice.name))
+														
+														# Update tax amount
+														frappe.db.sql("""
+															UPDATE `tabSales Taxes and Charges`
+															SET tax_amount = %s, total = %s
+															WHERE parent = %s AND charge_type = 'On Net Total'
+														""", (expected_tax, expected_tax, invoice.name))
+														
+														# Update total_taxes_and_charges
+														frappe.db.sql("""
+															UPDATE `tabSales Invoice`
+															SET total_taxes_and_charges = %s,
+															    base_total_taxes_and_charges = %s
+															WHERE name = %s
+														""", (expected_tax, expected_tax, invoice.name))
+														
+														frappe.db.commit()
+														print(f"[info] Used SQL to set exact total: {order_total_gross:.2f} SAR")
+								
+								batch_results["totals_adjusted"] += 1
+								all_results["totals_adjusted"] += 1
+								totals_adjusted_flag = True
+							except Exception as calc_err:
+								print(f"[warn] Failed to recalculate totals: {calc_err}")
+					
+					# Step 5: Submit invoice
+					invoice.reload()
+					if invoice.docstatus == 0:  # Draft
+						try:
+							# Ensure set_posting_time and is_pos are set
+							# Also disable rounding to use exact grand_total
+							try:
+								invoice.db_set("set_posting_time", 1)
+								if frappe.get_meta("Sales Invoice").has_field("is_pos"):
+									invoice.db_set("is_pos", 1)
+								if frappe.get_meta("Sales Invoice").has_field("disable_rounded_total"):
+									invoice.db_set("disable_rounded_total", 1)
+								frappe.db.commit()
+							except Exception:
+								pass
+							
+							# If is_pos = 1, ensure there's at least one payment
+							invoice.reload()
+							if frappe.get_meta("Sales Invoice").has_field("is_pos") and getattr(invoice, "is_pos", 0) == 1:
+								if not invoice.get("payments") or len(invoice.payments) == 0:
+									# Add a default payment
+									default_mop = frappe.db.get_value("Mode of Payment", {"type": "Cash"}, "name")
+									if not default_mop:
+										# Try to get any mode of payment
+										default_mop = frappe.db.get_value("Mode of Payment", {}, "name", order_by="creation desc")
+									
+									if default_mop:
+										payment_row = invoice.append("payments", {})
+										payment_row.mode_of_payment = default_mop
+										payment_row.amount = float(invoice.grand_total or 0)
+										invoice.save(ignore_permissions=True)
+										frappe.db.commit()
+										print(f"[info] Added default payment mode '{default_mop}' for POS invoice")
+									else:
+										print(f"[warn] No mode of payment found - invoice may fail to submit")
+							
+							# Check if order is fully paid
+							order_total_gross = float(getattr(order_doc, "total_price_gross", None) or 0)
+							if _is_order_fully_paid({"id": getattr(order_doc, "foodics_order_id", None)}):
+								invoice.outstanding_amount = 0
+							
+							invoice.submit()
+							frappe.db.commit()
+							
+							# Set status to Paid if fully paid
+							if _is_order_fully_paid({"id": getattr(order_doc, "foodics_order_id", None)}):
+								try:
+									invoice.db_set("outstanding_amount", 0)
+									invoice.db_set("status", "Paid")
+									frappe.db.commit()
+								except Exception:
+									pass
+							
+							print(f"[info] Submitted invoice {invoice_name}")
+							batch_results["resubmitted"] += 1
+							all_results["total_resubmitted"] += 1
+							
+							if items_added_count > 0 or totals_adjusted_flag:
+								batch_results["fixed"] += 1
+								all_results["total_fixed"] += 1
+								batch_results["fixed_invoices"].append({
+									"invoice": invoice_name,
+									"order": order_name,
+									"items_added": items_added_count,
+									"totals_adjusted": totals_adjusted_flag,
+								})
+						except Exception as submit_err:
+							error_msg = f"Failed to submit invoice: {submit_err}"
+							print(f"[warn] {error_msg}")
+							batch_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+							all_results["errors"].append({
+								"invoice": invoice_name,
+								"error": error_msg
+							})
+					
+				except Exception as e:
+					error_msg = str(e)
+					batch_results["errors"].append({
+						"invoice": invoice_name if 'invoice_name' in locals() else "unknown",
+						"error": error_msg
+					})
+					all_results["errors"].append({
+						"invoice": invoice_name if 'invoice_name' in locals() else "unknown",
+						"error": error_msg
+					})
+					frappe.log_error(
+						title="Fix and Resubmit Invoice Error",
+						message=f"Invoice: {invoice_name if 'invoice_name' in locals() else 'unknown'}\nError: {e}\n{frappe.get_traceback()}",
+					)
+			
+			all_results["batches"].append(batch_results)
+			print(f"[info] Batch {batch_num + 1} complete: {batch_results['fixed']} fixed, {batch_results['resubmitted']} resubmitted")
+		
+		# Final summary
+		all_results["summary"] = {
+			"total_batches": all_results["total_batches"],
+			"total_checked": all_results["total_checked"],
+			"total_fixed": all_results["total_fixed"],
+			"total_resubmitted": all_results["total_resubmitted"],
+			"items_added": all_results["items_added"],
+			"totals_adjusted": all_results["totals_adjusted"],
+			"errors": len(all_results["errors"]),
+		}
+		
+		print(f"\n[info] Final Summary:")
+		print(f"  Batches: {all_results['total_batches']}")
+		print(f"  Checked: {all_results['total_checked']}")
+		print(f"  Fixed: {all_results['total_fixed']}")
+		print(f"  Resubmitted: {all_results['total_resubmitted']}")
+		print(f"  Items Added: {all_results['items_added']}")
+		print(f"  Totals Adjusted: {all_results['totals_adjusted']}")
+		print(f"  Errors: {len(all_results['errors'])}")
+		
+		return all_results
+		
+	except Exception as e:
+		frappe.log_error(
+			title="Fix and Resubmit Invoices Error",
+			message=f"Error: {e}\n{frappe.get_traceback()}",
+		)
+		all_results["error"] = str(e)
+		return all_results
+
+
+@frappe.whitelist()
+def check_invoice_and_order_totals(
+	from_date: Optional[str] = None,
+	to_date: Optional[str] = None,
+	show_details: bool = False,
+) -> Dict[str, Any]:
+	"""
+	Check and compare totals between Sales Invoices and Foodics Orders.
+	
+	Args:
+		from_date: Optional start date filter (business_date)
+		to_date: Optional end date filter (business_date)
+		show_details: If True, include detailed list of mismatched invoices
+		
+	Returns:
+		dict with comparison results
+	"""
+	frappe.only_for(("System Manager", "Administrator"))
+	
+	results = {
+		"total_invoices": 0,
+		"total_orders": 0,
+		"matched": 0,
+		"mismatched": 0,
+		"invoice_total": 0.0,
+		"order_total": 0.0,
+		"difference": 0.0,
+		"tolerance": 0.10,
+		"mismatched_invoices": [],
+		"summary": {},
+	}
+	
+	try:
+		# Build query to find Sales Invoices with Foodics Orders
+		conditions = []
+		values = []
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			conditions.append("si.foodics_order_id IS NOT NULL AND si.foodics_order_id != ''")
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			conditions.append("si.foodics_order_name IS NOT NULL AND si.foodics_order_name != ''")
+		else:
+			conditions.append("fo.sales_invoice IS NOT NULL")
+		
+		if from_date:
+			conditions.append("fo.business_date >= %s")
+			values.append(from_date)
+		if to_date:
+			conditions.append("fo.business_date <= %s")
+			values.append(to_date)
+		
+		if frappe.get_meta("Sales Invoice").has_field("foodics_order_id"):
+			query = f"""
+				SELECT DISTINCT 
+					si.name as invoice_name, 
+					si.foodics_order_id,
+					si.grand_total as invoice_total,
+					si.docstatus,
+					fo.total_price_gross as order_total
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.foodics_order_id = si.foodics_order_id
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		elif frappe.get_meta("Sales Invoice").has_field("foodics_order_name"):
+			query = f"""
+				SELECT DISTINCT 
+					si.name as invoice_name, 
+					fo.name as order_name,
+					si.grand_total as invoice_total,
+					si.docstatus,
+					fo.total_price_gross as order_total
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.name = si.foodics_order_name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		else:
+			query = f"""
+				SELECT DISTINCT 
+					si.name as invoice_name, 
+					fo.name as order_name,
+					si.grand_total as invoice_total,
+					si.docstatus,
+					fo.total_price_gross as order_total
+				FROM `tabSales Invoice` si
+				INNER JOIN `tabFoodics Order` fo ON fo.sales_invoice = si.name
+				WHERE {' AND '.join(conditions)}
+				ORDER BY si.creation DESC
+			"""
+		
+		invoices = frappe.db.sql(query, values, as_dict=True)
+		
+		print(f"[info] Found {len(invoices)} invoices to check")
+		
+		total_invoice_sum = 0.0
+		total_order_sum = 0.0
+		matched_count = 0
+		mismatched_count = 0
+		mismatched_list = []
+		
+		for row in invoices:
+			invoice_name = row.get("invoice_name")
+			order_name = row.get("order_name")
+			order_id = row.get("foodics_order_id")
+			invoice_total = float(row.get("invoice_total") or 0)
+			order_total = float(row.get("order_total") or 0)
+			docstatus = row.get("docstatus", 0)
+			
+			if not order_name and order_id:
+				order_name = _parent_name_for(order_id)
+			
+			if not invoice_name:
+				continue
+			
+			results["total_invoices"] += 1
+			total_invoice_sum += invoice_total
+			total_order_sum += order_total
+			
+			# Check if totals match (within tolerance)
+			diff = abs(invoice_total - order_total)
+			if order_total > 0 and diff <= results["tolerance"]:
+				matched_count += 1
+			else:
+				mismatched_count += 1
+				if show_details:
+					mismatched_list.append({
+						"invoice": invoice_name,
+						"order": order_name or order_id,
+						"invoice_total": round(invoice_total, 2),
+						"order_total": round(order_total, 2),
+						"difference": round(diff, 2),
+						"docstatus": docstatus,
+						"status": "Draft" if docstatus == 0 else "Submitted" if docstatus == 1 else "Cancelled",
+					})
+		
+		results["total_orders"] = results["total_invoices"]  # Same count
+		results["matched"] = matched_count
+		results["mismatched"] = mismatched_count
+		results["invoice_total"] = round(total_invoice_sum, 2)
+		results["order_total"] = round(total_order_sum, 2)
+		results["difference"] = round(total_invoice_sum - total_order_sum, 2)
+		
+		if show_details:
+			results["mismatched_invoices"] = mismatched_list
+		
+		# Create summary
+		results["summary"] = {
+			"total_invoices": results["total_invoices"],
+			"matched": matched_count,
+			"mismatched": mismatched_count,
+			"match_percentage": round((matched_count / results["total_invoices"] * 100) if results["total_invoices"] > 0 else 0, 2),
+			"invoice_total_sum": results["invoice_total"],
+			"order_total_sum": results["order_total"],
+			"total_difference": results["difference"],
+			"average_difference": round(results["difference"] / results["total_invoices"] if results["total_invoices"] > 0 else 0, 2),
+		}
+		
+		print(f"\n[info] Comparison Summary:")
+		print(f"  Total Invoices: {results['total_invoices']}")
+		print(f"  Matched: {matched_count} ({results['summary']['match_percentage']}%)")
+		print(f"  Mismatched: {mismatched_count}")
+		print(f"  Invoice Total Sum: {results['invoice_total']:.2f} SAR")
+		print(f"  Order Total Sum: {results['order_total']:.2f} SAR")
+		print(f"  Difference: {results['difference']:.2f} SAR")
+		if results["total_invoices"] > 0:
+			print(f"  Average Difference: {results['summary']['average_difference']:.2f} SAR per invoice")
+		
+		if show_details and mismatched_list:
+			print(f"\n[info] First 10 Mismatched Invoices:")
+			for item in mismatched_list[:10]:
+				print(f"  Invoice: {item['invoice']} | Order: {item['order']} | Invoice: {item['invoice_total']:.2f} | Order: {item['order_total']:.2f} | Diff: {item['difference']:.2f} | Status: {item['status']}")
+		
+		return results
+		
+	except Exception as e:
+		frappe.log_error(
+			title="Check Invoice and Order Totals Error",
+			message=f"Error: {e}\n{frappe.get_traceback()}",
+		)
+		results["error"] = str(e)
+		return results

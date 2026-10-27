@@ -24,3 +24,22 @@ def execute():
 	frappe.db.commit()
 	frappe.msgprint("Customer ID field has been added to Foodics Order doctype.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

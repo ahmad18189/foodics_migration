@@ -7,3 +7,22 @@ from frappe.model.document import Document
 class BranchCostCenterMapping(Document):
 	pass
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

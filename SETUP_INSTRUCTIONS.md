@@ -97,3 +97,22 @@ bench --site food.milestoneksa.com execute foodics_migration.api_orders.create_s
 - **Sales Invoice Creation**: Automatically create Sales Invoices from synced orders
 - **Foodics ID Tracking**: All synced records store their Foodics IDs for reference
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -161,7 +161,7 @@ def _replace_item_price(cfg: FoodicsConfig, item_code: str, gross_price: float):
         filters={"item_code": item_code, "price_list": cfg.foodics_price_list},
         fieldname="name",
     )
-    
+
     doc = {
         "doctype": "Item Price",
         "item_code": item_code,
@@ -455,10 +455,9 @@ def sync_foodics_products():
                     skipped += 1
                 elif was_existing:
                     updated += 1
-                    count += 1
                 else:
                     created += 1
-                    count += 1
+                count += 1
                 
                 # commit batching
                 if (count + skipped) % cfg.commit_every_n_records == 0:
@@ -688,10 +687,9 @@ def sync_foodics_customers():
                     skipped += 1
                 elif was_existing:
                     updated += 1
-                    count += 1
                 else:
                     created += 1
-                    count += 1
+                count += 1
                 
                 if (count + skipped) % cfg.commit_every_n_records == 0:
                     frappe.db.commit()
@@ -741,8 +739,8 @@ def sync_foodics_addresses():
                 for addr in addresses:
                     _upsert_address(cfg, s, addr, customer_name)
                     count += 1
-                    if count % cfg.commit_every_n_records == 0:
-                        frappe.db.commit()
+                if count % cfg.commit_every_n_records == 0:
+                    frappe.db.commit()
             except Exception:
                 frappe.db.rollback()
                 frappe.log_error(title="Foodics Address Sync Error", message=frappe.get_traceback())
@@ -1167,10 +1165,9 @@ def sync_foodics_payment_methods():
                     skipped += 1
                 elif was_existing:
                     updated += 1
-                    count += 1
                 else:
                     created += 1
-                    count += 1
+                count += 1
                 
                 # Commit batching
                 if (count + skipped + failed) % cfg.commit_every_n_records == 0:
@@ -1388,7 +1385,7 @@ def sync_foodics_users():
             "skipped": skipped,
             "failed": failed,
         }
-        
+
     except Exception as e:
         frappe.db.rollback()
         frappe.log_error(title="Foodics User Sync Error", message=frappe.get_traceback())

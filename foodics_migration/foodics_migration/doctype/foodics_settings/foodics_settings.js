@@ -102,6 +102,15 @@ function show_sync_actions_dialog(frm) {
 			},
 		],
 	});
+	
+	const toggleToDateField = () => {
+		const isBusinessDate = dialog.fields_dict.date_field.get_value() === "business_date";
+		dialog.set_df_property("to_date", "hidden", isBusinessDate);
+		dialog.set_df_property("to_date", "reqd", !isBusinessDate);
+	};
+
+	toggleToDateField();
+	dialog.fields_dict.date_field.$input.on("change", toggleToDateField);
 	dialog.show();
 }
 
@@ -355,7 +364,7 @@ function sync_all_master_data(frm) {
 
 function sync_orders_and_create_invoices(frm) {
 	let dialog = new frappe.ui.Dialog({
-		title: __("Sync Orders & Create Invoices"),
+		title: __("Sync Orders & Create Invoices (Business Date)"),
 		fields: [
 			{
 				fieldtype: "Date",
@@ -368,7 +377,7 @@ function sync_orders_and_create_invoices(frm) {
 				fieldtype: "Date",
 				label: __("To Date"),
 				fieldname: "to_date",
-				reqd: 1,
+				reqd: 0,
 				default: frappe.datetime.get_today()
 			},
 			{
@@ -385,13 +394,19 @@ function sync_orders_and_create_invoices(frm) {
 			},
 			{
 				fieldtype: "HTML",
-				options: __("<p style='color: #666;'>This will sync only fully paid orders from Foodics and create paid Sales Invoices. Orders that already exist or have invoices will be skipped.</p><p style='color: #666;'><strong>Note:</strong> This will run in the background to prevent timeouts.</p>")
+				options: __("<p style='color: #666;'>This will sync only fully paid orders from Foodics and create paid Sales Invoices. Orders that already exist or have invoices will be skipped.</p><p style='color: #666;'><strong>Note:</strong> When you select <strong>Business Date</strong>, only the From Date is honored (`business_date_after`). The sync always runs via background job to avoid timeouts.</p>")
 			}
 		],
-		primary_action_label: __("Start Sync"),
+	primary_action_label: __("Start Sync"),
 		primary_action(values) {
 			dialog.hide();
 			
+		if (values.date_field !== "business_date" && !values.to_date) {
+			frappe.msgprint(__("To Date is required when filtering by {0}.", [values.date_field]));
+			dialog.show();
+			return;
+		}
+
 			frappe.confirm(
 				__("This will sync fully paid orders and create Sales Invoices in the background. Continue?"),
 				function() {
@@ -499,45 +514,53 @@ function create_sales_invoices_from_orders(frm) {
 						__("This will create Sales Invoices for {0} Foodics Order(s). Continue?", [count]),
 						function() {
 							// Yes - proceed
-							frappe.call({
-								method: "foodics_migration.api_orders.create_sales_invoices_from_orders",
-								args: {
-									from_date: values.from_date,
-									to_date: values.to_date,
-									date_field: values.date_field,
-									only_without_invoice: values.only_without_invoice,
-								},
-								freeze: true,
-								freeze_message: __("Creating Sales Invoices from Foodics Orders..."),
-								callback: function(r) {
-									if (r.exc) {
-										frappe.msgprint(__("Error creating invoices: {0}", [r.exc]));
-									} else {
-										let result = r.message || {};
-										let message = __("Sales Invoices creation completed.");
-										if (result.created) {
-											message += `\nCreated: ${result.created}`;
-										}
-										if (result.skipped) {
-											message += `\nSkipped: ${result.skipped}`;
-										}
-										if (result.failed) {
-											message += `\nFailed: ${result.failed}`;
-										}
-										frappe.show_alert({
-											message: message,
-											indicator: "green",
-										});
-										frm.reload_doc();
+					frappe.call({
+						method: "foodics_migration.api_orders.enqueue_create_sales_invoices_job",
+						args: {
+							from_date: values.from_date,
+							to_date: values.to_date,
+							date_field: values.date_field,
+							only_without_invoice: values.only_without_invoice,
+						},
+						freeze: true,
+						freeze_message: __("Queuing sales invoice creation job..."),
+						callback: function(r) {
+							if (r.exc) {
+								frappe.msgprint(__("Error queuing job: {0}", [r.exc]));
+							} else {
+								let message = __("Sales invoice creation has been queued.");
+								if (r.message) {
+									if (r.message.job_id) {
+										message += `\n\nJob ID: ${r.message.job_id}`;
 									}
-								},
-							});
+									if (r.message.sync_log_name) {
+										message += `\n\nView progress: <a href=\"/app/foodics-sync-log/${r.message.sync_log_name}\" target=\"_blank\">${r.message.sync_log_name}</a>`;
+									}
+								}
+								message += `\n\nThe sync is running in the background. Check the Foodics Sync Log list for updates.`;
+								frappe.show_alert({
+									message,
+									indicator: "blue",
+								});
+								frm.reload_doc();
+							}
+						},
+					});
 						}
 					);
 				},
 			});
 		},
 	});
+	
+	const toggleToDateField = () => {
+		const isBusinessDate = dialog.get_value("date_field") === "business_date";
+		dialog.set_df_property("to_date", "hidden", isBusinessDate);
+		dialog.set_df_property("to_date", "reqd", !isBusinessDate);
+	};
+
+	toggleToDateField();
+	dialog.fields_dict.date_field.$input.on("change", () => toggleToDateField());
 	dialog.show();
 }
 

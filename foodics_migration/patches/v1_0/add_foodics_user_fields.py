@@ -38,3 +38,22 @@ def execute():
 	frappe.db.commit()
 	frappe.msgprint("Custom fields for Foodics User ID tracking have been created successfully.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -190,3 +190,22 @@ def execute():
 	
 	frappe.msgprint("Foodics Settings fields have been added successfully.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -44,3 +44,22 @@ def execute():
 	frappe.db.commit()
 	frappe.msgprint("Custom fields for Foodics Payment Method ID tracking have been created successfully.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
